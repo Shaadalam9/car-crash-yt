@@ -133,7 +133,7 @@ def run_location_stage(state: Dict[str, Any]) -> int:
                 fields = {}
             segment["location"] = geocode(fields, cache)
             processed += 1
-            write_json_atomic(settings.GEOCODE_CACHE, cache)
-            save_state(settings.STATE_JSON, state)
+    if processed:
+        write_json_atomic(settings.GEOCODE_CACHE, cache)
+        save_state(settings.STATE_JSON, state)
     return processed
-

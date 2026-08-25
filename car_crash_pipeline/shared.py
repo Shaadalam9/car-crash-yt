@@ -9,6 +9,7 @@ import os
 import re
 import shutil
 import subprocess
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
@@ -26,6 +27,18 @@ def load_json(path: Path, default: Any) -> Any:
         return json.load(handle)
 
 
+def replace_file_with_retry(source: Path, destination: Path, attempts: int = 8) -> None:
+    """Replace a file while tolerating short lived Windows file locks."""
+    for attempt in range(attempts):
+        try:
+            os.replace(source, destination)
+            return
+        except PermissionError:
+            if attempt + 1 >= attempts:
+                raise
+            time.sleep(min(0.05 * (2**attempt), 1.0))
+
+
 def write_json_atomic(path: Path, value: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + f".tmp.{os.getpid()}")
@@ -34,7 +47,7 @@ def write_json_atomic(path: Path, value: Any) -> None:
         handle.write("\n")
         handle.flush()
         os.fsync(handle.fileno())
-    os.replace(temporary, path)
+    replace_file_with_retry(temporary, path)
 
 
 def run_command(
@@ -166,4 +179,3 @@ def unload_model(owner: Any) -> None:
             torch.cuda.empty_cache()
     except Exception:
         pass
-

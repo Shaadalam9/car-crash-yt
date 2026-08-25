@@ -7,6 +7,7 @@ import os
 import re
 import shutil
 import tempfile
+import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -195,6 +196,33 @@ def invalid_crash_decision(raw_response: str, error: str) -> CrashDecision:
         raw_response=raw_response,
         error=error,
     )
+
+
+def has_visual_review_errors(record: Dict[str, Any]) -> bool:
+    """Return whether a saved visual review contains retryable errors."""
+    for field in ("boundary_reviews", "segment_reviews"):
+        reviews = record.get(field, [])
+        if isinstance(reviews, list) and any(
+            isinstance(item, dict) and item.get("error") for item in reviews
+        ):
+            return True
+    return False
+
+
+def _boundary_decision_from_record(value: Dict[str, Any]) -> BoundaryDecision:
+    return BoundaryDecision(
+        cut_time=float(value.get("cut_time", 0.0)),
+        is_edit_boundary=normalise_bool(value.get("is_edit_boundary")),
+        confidence=clamp_float(value.get("confidence")),
+        transition_type=clean_text(value.get("transition_type") or "none"),
+        short_reason=clean_text(value.get("short_reason")),
+        raw_response=str(value.get("raw_response") or ""),
+        error=optional_text(value.get("error")),
+    )
+
+
+def _review_key(start_time: Any, end_time: Any) -> tuple[float, float]:
+    return round(float(start_time), 3), round(float(end_time), 3)
 
 
 class CosmosCrashJudge:
@@ -456,6 +484,34 @@ def get_duration(video_path: Path) -> float:
     return duration
 
 
+def _run_sample_command(
+    command: List[str], destination: Path, *, timeout: float, label: str
+) -> None:
+    """Run transient FFmpeg sample creation with bounded retries."""
+    last_error = "unknown FFmpeg failure"
+    for attempt in range(5):
+        destination.unlink(missing_ok=True)
+        try:
+            result = run_command(command, timeout=timeout)
+            if (
+                result.returncode == 0
+                and destination.is_file()
+                and destination.stat().st_size > 0
+            ):
+                return
+            details = [
+                line.strip()
+                for line in (result.stderr or result.stdout).splitlines()
+                if line.strip()
+            ]
+            last_error = details[-1] if details else f"FFmpeg exit code {result.returncode}"
+        except Exception as exc:
+            last_error = str(exc)
+        if attempt < 4:
+            time.sleep(min(0.25 * (2**attempt), 2.0))
+    raise RuntimeError(f"{label} after 5 attempts: {last_error}")
+
+
 def _create_boundary_sample(video_path: Path, cut_time: float, duration: float, destination: Path) -> tuple[Path, float]:
     start = max(0.0, cut_time - settings.BOUNDARY_CONTEXT_SECONDS)
     end = min(duration, cut_time + settings.BOUNDARY_CONTEXT_SECONDS)
@@ -484,9 +540,12 @@ def _create_boundary_sample(video_path: Path, cut_time: float, duration: float, 
         "-y",
         str(destination),
     ]
-    result = run_command(command, timeout=300)
-    if result.returncode != 0:
-        raise RuntimeError("failed to create boundary sample")
+    _run_sample_command(
+        command,
+        destination,
+        timeout=300,
+        label="failed to create boundary sample",
+    )
     return destination, boundary_in_clip
 
 
@@ -519,30 +578,79 @@ def _create_segment_sample(video_path: Path, segment: FullSegment, destination: 
         "-y",
         str(destination),
     ]
-    result = run_command(command, timeout=600)
-    if result.returncode != 0:
-        raise RuntimeError("failed to create full segment sample")
+    _run_sample_command(
+        command,
+        destination,
+        timeout=600,
+        label="failed to create full segment sample",
+    )
     return destination, sample_fps
 
 
 def analyse_video(video_id: str, record: Dict[str, Any], judge: CosmosCrashJudge) -> Dict[str, Any]:
-    video_path = download_video(video_id)
+    stored_path = optional_text(record.get("downloaded_path"))
+    existing_path = Path(stored_path) if stored_path else None
+    if existing_path is not None and existing_path.is_file() and _valid_video(existing_path):
+        video_path = existing_path
+        log(f"Reusing downloaded video for {video_id}")
+    else:
+        video_path = download_video(video_id)
     record["downloaded_path"] = str(video_path)
-    duration = get_duration(video_path)
+    try:
+        duration = float(record.get("duration_seconds"))
+        if not math.isfinite(duration) or duration <= 0:
+            raise ValueError
+    except (TypeError, ValueError):
+        duration = get_duration(video_path)
     record["duration_seconds"] = duration
-    detection = detect_candidate_cuts(video_path, duration)
-    record["cut_detection"] = {
-        "backend": detection.backend,
-        "candidate_count": len(detection.candidates),
-        "error": detection.error,
-    }
-    if detection.error:
-        raise RuntimeError(f"Cut detection failed: {detection.error}")
 
     boundary_reviews: List[BoundaryDecision] = []
+    saved_boundaries = record.get("boundary_reviews")
+    can_resume = (
+        record.get("visual_review_version") == CRASH_REVIEW_VERSION
+        and isinstance(saved_boundaries, list)
+        and bool(saved_boundaries)
+    )
+    if can_resume:
+        boundary_reviews = [
+            _boundary_decision_from_record(item)
+            for item in saved_boundaries
+            if isinstance(item, dict)
+        ]
+        log(
+            f"Resuming {sum(bool(item.error) for item in boundary_reviews)} failed "
+            f"boundary reviews for {video_id}"
+        )
+    else:
+        detection = detect_candidate_cuts(video_path, duration)
+        record["cut_detection"] = {
+            "backend": detection.backend,
+            "candidate_count": len(detection.candidates),
+            "error": detection.error,
+        }
+        if detection.error:
+            raise RuntimeError(f"Cut detection failed: {detection.error}")
+        boundary_reviews = [
+            BoundaryDecision(
+                cut_time=cut_time,
+                is_edit_boundary=False,
+                confidence=0.0,
+                transition_type="none",
+                short_reason="Pending visual verification",
+                raw_response="",
+                error="pending",
+            )
+            for cut_time in detection.candidates
+        ]
+
     with tempfile.TemporaryDirectory(prefix="crash-review-", dir=settings.DATA_DIR) as temporary:
         work = Path(temporary)
-        for index, cut_time in enumerate(detection.candidates):
+        pending_boundary_count = sum(bool(item.error) for item in boundary_reviews)
+        completed_boundaries = 0
+        for index, existing_boundary in enumerate(boundary_reviews):
+            if not existing_boundary.error:
+                continue
+            cut_time = existing_boundary.cut_time
             try:
                 sample, local_time = _create_boundary_sample(
                     video_path, cut_time, duration, work / f"boundary-{index:05d}.mp4"
@@ -558,52 +666,127 @@ def analyse_video(video_id: str, record: Dict[str, Any], judge: CosmosCrashJudge
                     raw_response="",
                     error="sample_error",
                 )
-            boundary_reviews.append(decision)
+            boundary_reviews[index] = decision
+            completed_boundaries += 1
+            if (
+                completed_boundaries == 1
+                or completed_boundaries % 10 == 0
+                or completed_boundaries == pending_boundary_count
+            ):
+                log(
+                    f"Boundary review progress for {video_id}: "
+                    f"{completed_boundaries}/{pending_boundary_count}"
+                )
+
+        record["boundary_reviews"] = [asdict(item) for item in boundary_reviews]
+        record["visual_review_version"] = CRASH_REVIEW_VERSION
 
         verified = [item.cut_time for item in boundary_reviews if item.is_edit_boundary]
         full_segments = build_full_segments(duration, verified)
         accepted: List[Dict[str, Any]] = []
         all_reviews: List[Dict[str, Any]] = []
+        reusable_reviews: Dict[tuple[float, float], Dict[str, Any]] = {}
+        if can_resume:
+            saved_segments = record.get("segment_reviews", [])
+            if not isinstance(saved_segments, list):
+                saved_segments = []
+            for item in saved_segments:
+                if not isinstance(item, dict) or item.get("error"):
+                    continue
+                try:
+                    reusable_reviews[
+                        _review_key(item.get("start_time"), item.get("end_time"))
+                    ] = item
+                except (TypeError, ValueError):
+                    continue
+            log(
+                f"Reusing {len(reusable_reviews)} successful segment reviews for "
+                f"{video_id}"
+            )
         timestamp_labels = extract_description_timestamps(
             record.get("metadata", {}).get("description")
         )
+        pending_segment_count = sum(
+            _review_key(segment.start_time, segment.end_time) not in reusable_reviews
+            for segment in full_segments
+        )
+        if pending_segment_count:
+            log(f"Reviewing {pending_segment_count} remaining segments for {video_id}")
+        completed_segments = 0
         for index, segment in enumerate(full_segments):
-            try:
-                sample, sample_fps = _create_segment_sample(
-                    video_path, segment, work / f"segment-{index:05d}.mp4"
+            key = _review_key(segment.start_time, segment.end_time)
+            saved_review = reusable_reviews.get(key)
+            if saved_review is not None:
+                review = dict(saved_review)
+                review.update(
+                    {
+                        "segment_index": index,
+                        "start_time": round(segment.start_time, 3),
+                        "end_time": round(segment.end_time, 3),
+                        "duration_seconds": round(segment.duration, 3),
+                        "timestamp_labels": timestamp_labels_for_segment(
+                            timestamp_labels, segment.start_time, segment.end_time
+                        ),
+                    }
                 )
-                decision = judge.review_segment(
-                    sample, record.get("metadata", {}), segment, sample_fps
-                )
-            except Exception as exc:
-                decision = invalid_crash_decision("", f"sample_error: {exc}")
-            review = {
-                "segment_index": index,
-                "start_time": round(segment.start_time, 3),
-                "end_time": round(segment.end_time, 3),
-                "duration_seconds": round(segment.duration, 3),
-                "timestamp_labels": timestamp_labels_for_segment(
-                    timestamp_labels, segment.start_time, segment.end_time
-                ),
-                **asdict(decision),
-            }
+            else:
+                try:
+                    sample, sample_fps = _create_segment_sample(
+                        video_path, segment, work / f"segment-{index:05d}.mp4"
+                    )
+                    decision = judge.review_segment(
+                        sample, record.get("metadata", {}), segment, sample_fps
+                    )
+                except Exception as exc:
+                    decision = invalid_crash_decision("", f"sample_error: {exc}")
+                review = {
+                    "segment_index": index,
+                    "start_time": round(segment.start_time, 3),
+                    "end_time": round(segment.end_time, 3),
+                    "duration_seconds": round(segment.duration, 3),
+                    "timestamp_labels": timestamp_labels_for_segment(
+                        timestamp_labels, segment.start_time, segment.end_time
+                    ),
+                    **asdict(decision),
+                }
+                completed_segments += 1
+                if (
+                    completed_segments == 1
+                    or completed_segments % 10 == 0
+                    or completed_segments == pending_segment_count
+                ):
+                    log(
+                        f"Segment review progress for {video_id}: "
+                        f"{completed_segments}/{pending_segment_count}"
+                    )
             all_reviews.append(review)
-            if decision.is_crash:
-                if decision.impact_time_seconds is not None:
+            if normalise_bool(review.get("is_crash")):
+                if review.get("impact_time_seconds") is not None:
                     review["impact_time_in_video"] = round(
-                        segment.start_time + decision.impact_time_seconds, 3
+                        segment.start_time + float(review["impact_time_seconds"]), 3
                     )
                 else:
                     review["impact_time_in_video"] = None
                 accepted.append(review)
+            record["segment_reviews"] = all_reviews
+            record["segments"] = accepted
 
     record["boundary_reviews"] = [asdict(item) for item in boundary_reviews]
     record["segment_reviews"] = all_reviews
     record["segments"] = accepted
     record["visual_review_version"] = CRASH_REVIEW_VERSION
-    record["status"] = "complete" if accepted else "visual_rejected"
-    record["error"] = None
-    if settings.DELETE_VIDEO_AFTER_PROCESSING:
+    boundary_error_count = sum(bool(item.error) for item in boundary_reviews)
+    segment_error_count = sum(bool(item.get("error")) for item in all_reviews)
+    if boundary_error_count or segment_error_count:
+        record["status"] = "visual_error"
+        record["error"] = (
+            f"Retry required for {boundary_error_count} boundary reviews and "
+            f"{segment_error_count} segment reviews"
+        )
+    else:
+        record["status"] = "complete" if accepted else "visual_rejected"
+        record["error"] = None
+    if settings.DELETE_VIDEO_AFTER_PROCESSING and record["status"] != "visual_error":
         video_path.unlink(missing_ok=True)
         record["downloaded_path"] = None
     return record
@@ -619,6 +802,7 @@ def run_visual_stage(state: Dict[str, Any], after_video: Optional[Any] = None) -
         and (
             record.get("status") not in {"complete", "visual_rejected"}
             or record.get("visual_review_version") != CRASH_REVIEW_VERSION
+            or has_visual_review_errors(record)
         )
     ][: settings.MAX_VIDEOS_PER_RUN]
     if not pending:

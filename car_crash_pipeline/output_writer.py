@@ -8,6 +8,7 @@ import os
 from typing import Any, Dict, Iterable
 
 from . import settings
+from .shared import replace_file_with_retry
 
 
 COLUMNS = [
@@ -112,4 +113,4 @@ def write_output_csv(state: Dict[str, Any]) -> None:
             writer.writerow(row)
         handle.flush()
         os.fsync(handle.fileno())
-    os.replace(temporary, settings.OUTPUT_CSV)
+    replace_file_with_retry(temporary, settings.OUTPUT_CSV)

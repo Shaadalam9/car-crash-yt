@@ -1,14 +1,23 @@
 """Fast standard library tests that do not load models or access YouTube."""
 
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from car_crash_pipeline.crash_review import (
+    _run_sample_command,
     extract_description_timestamps,
+    has_visual_review_errors,
     normalise_crash_decision,
     timestamp_labels_for_segment,
 )
 from car_crash_pipeline.cut_detection import build_full_segments, merge_nearby_times
+from car_crash_pipeline.location import run_location_stage
 from car_crash_pipeline.output_writer import iter_rows
+from car_crash_pipeline.shared import replace_file_with_retry
+from car_crash_pipeline.youtube_discovery import YouTubeDiscovery
 
 
 class CorePipelineTests(unittest.TestCase):
@@ -81,6 +90,102 @@ class CorePipelineTests(unittest.TestCase):
         self.assertEqual([item["timestamp_seconds"] for item in labels], [0, 65, 3723])
         selected = timestamp_labels_for_segment(labels, 70.0, 100.0)
         self.assertEqual([item["label"] for item in selected], ["First crash"])
+
+    def test_full_seed_batch_skips_search(self) -> None:
+        state = {"videos": {}}
+        seed_payload = {
+            "items": [
+                {
+                    "id": "jJXT2zGlSc0",
+                    "snippet": {"title": "Crash compilation"},
+                    "contentDetails": {"duration": "PT1H1M19S"},
+                }
+            ]
+        }
+        with (
+            patch("car_crash_pipeline.youtube_discovery.settings.SEED_VIDEO_IDS", ["jJXT2zGlSc0"]),
+            patch("car_crash_pipeline.youtube_discovery.settings.MAX_NEW_CANDIDATES", 1),
+            patch("car_crash_pipeline.youtube_discovery.save_state"),
+            patch(
+                "car_crash_pipeline.youtube_discovery._request",
+                return_value=seed_payload,
+            ) as request,
+        ):
+            discovered = YouTubeDiscovery(["test-key"]).discover(state)
+
+        self.assertEqual(discovered, 1)
+        self.assertEqual(request.call_count, 1)
+        self.assertEqual(request.call_args.args[0], "videos")
+
+    def test_saved_visual_errors_are_retryable(self) -> None:
+        self.assertTrue(
+            has_visual_review_errors(
+                {"segment_reviews": [{"segment_index": 4, "error": "sample_error"}]}
+            )
+        )
+        self.assertFalse(
+            has_visual_review_errors(
+                {"segment_reviews": [{"segment_index": 4, "error": None}]}
+            )
+        )
+
+    def test_sample_creation_retries_transient_ffmpeg_failure(self) -> None:
+        with TemporaryDirectory() as temporary:
+            destination = Path(temporary) / "sample.mp4"
+            attempts = 0
+
+            def run(command, timeout):
+                nonlocal attempts
+                attempts += 1
+                if attempts == 1:
+                    return SimpleNamespace(returncode=1, stderr="temporarily locked", stdout="")
+                destination.write_bytes(b"video")
+                return SimpleNamespace(returncode=0, stderr="", stdout="")
+
+            with (
+                patch("car_crash_pipeline.crash_review.run_command", side_effect=run),
+                patch("car_crash_pipeline.crash_review.time.sleep"),
+            ):
+                _run_sample_command(
+                    ["ffmpeg"], destination, timeout=10, label="sample failed"
+                )
+
+        self.assertEqual(attempts, 2)
+
+    def test_atomic_replace_retries_windows_lock(self) -> None:
+        with (
+            patch(
+                "car_crash_pipeline.shared.os.replace",
+                side_effect=[PermissionError("locked"), None],
+            ) as replace,
+            patch("car_crash_pipeline.shared.time.sleep"),
+        ):
+            replace_file_with_retry(Path("source"), Path("destination"))
+        self.assertEqual(replace.call_count, 2)
+
+    def test_location_stage_saves_once_for_multiple_segments(self) -> None:
+        state = {
+            "videos": {
+                "abc": {
+                    "status": "complete",
+                    "text_decision": {},
+                    "segments": [
+                        {"location_evidence": "none"},
+                        {"location_evidence": "none"},
+                    ],
+                }
+            }
+        }
+        with (
+            patch("car_crash_pipeline.location.load_json", return_value={}),
+            patch("car_crash_pipeline.location.write_json_atomic") as write_cache,
+            patch("car_crash_pipeline.location.save_state") as save,
+        ):
+            processed = run_location_stage(state)
+
+        self.assertEqual(processed, 2)
+        self.assertEqual(write_cache.call_count, 1)
+        self.assertEqual(save.call_count, 1)
 
 
 if __name__ == "__main__":

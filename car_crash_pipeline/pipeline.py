@@ -6,7 +6,12 @@ import time
 from typing import Any, Dict
 
 from . import settings
-from .crash_review import CRASH_REVIEW_VERSION, reset_temp_directory, run_visual_stage
+from .crash_review import (
+    CRASH_REVIEW_VERSION,
+    has_visual_review_errors,
+    reset_temp_directory,
+    run_visual_stage,
+)
 from .location import run_location_stage
 from .metadata_filter import run_text_stage
 from .output_writer import write_output_csv
@@ -41,6 +46,8 @@ def requires_processing(record: Any) -> bool:
         return True
     if not decision.get("include"):
         return False
+    if has_visual_review_errors(record):
+        return True
     if record.get("status") not in FINAL_STATUSES:
         return True
     return record.get("visual_review_version") != CRASH_REVIEW_VERSION
@@ -105,4 +112,3 @@ def main() -> None:
     except KeyboardInterrupt:
         update_outputs(state)
         log("Stopped by the user; current state and CSV were saved")
-
