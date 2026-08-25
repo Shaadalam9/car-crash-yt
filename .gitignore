@@ -1,0 +1,22 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Secrets and local configuration
+secret
+config
+.env
+*.env
+
+# Data files
+data
+www.youtube.com_cookies.txt
+
+# Operating system files
+.DS_Storecookies.txt
+/cookies.txt
+cookies.txt
