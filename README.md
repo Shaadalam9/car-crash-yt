@@ -135,6 +135,7 @@ Important settings include:
 | `MIN_TEXT_CONFIDENCE` | Metadata acceptance threshold |
 | `MIN_BOUNDARY_CONFIDENCE` | Verified compilation edit threshold |
 | `MIN_CRASH_CONFIDENCE` | Accepted segment threshold |
+| `MAX_REVIEW_CYCLES` | Maximum saved retry cycles before an invalid review is skipped |
 | `SAMPLE_FRAME_COUNT` | Approximate frame budget across a complete segment |
 | `SAMPLE_MAX_FPS` | Maximum sampling rate for short clips |
 | `CUT_BACKEND` | `ffmpeg_cuda`, `ffmpeg_cpu`, or `auto` |
@@ -145,6 +146,11 @@ Important settings include:
 
 There is deliberately no minimum video duration, maximum video duration,
 minimum segment duration, or maximum segment duration setting.
+
+Discovery stores one pagination cursor per query in `state.json`. A later cycle
+continues from the next unvisited YouTube search page, while IDs already stored
+under `videos` are never added to another processing batch. Keep `state.json`
+when running continuously because it is the duplicate and pagination record.
 
 ## Running
 
