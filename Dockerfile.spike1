@@ -1,31 +1,103 @@
-FROM nvidia/cuda:13.0.2-cudnn-devel-ubuntu24.04
+# syntax=docker/dockerfile:1.7
+
+FROM nvidia/cuda:13.3.1-cudnn-runtime-ubuntu24.04
+
+ARG APP_UID=20234844
+ARG APP_GID=20234844
+ARG PYTHON_VERSION=3.12.13
 
 ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    CC=/usr/bin/gcc \
+    CXX=/usr/bin/g++ \
     UV_LINK_MODE=copy \
-    UV_PROJECT_ENVIRONMENT=/opt/car-crash-yt/.venv \
-    HF_HOME=/mnt/car-crash-yt/huggingface \
-    HF_HUB_CACHE=/mnt/car-crash-yt/huggingface/hub \
-    TOKENIZERS_PARALLELISM=false
+    UV_PROJECT_ENVIRONMENT=/opt/venv \
+    UV_PYTHON_INSTALL_DIR=/opt/uv-python \
+    DENO_INSTALL=/usr/local \
+    HF_HOME=/mnt/car-crash-yt/car-crash-yt/huggingface \
+    HF_HUB_CACHE=/mnt/car-crash-yt/car-crash-yt/huggingface/hub \
+    TOKENIZERS_PARALLELISM=false \
+    PATH=/opt/venv/bin:/usr/local/bin:${PATH}
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends \
+        build-essential \
         ca-certificates \
         curl \
         ffmpeg \
         git \
-        python3.12 \
-        python3.12-venv \
+        libglib2.0-0 \
+        libgl1 \
+        tini \
+        unzip \
     && rm -rf /var/lib/apt/lists/*
 
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh \
-    && ln -s /root/.local/bin/uv /usr/local/bin/uv
+    && install -m 0755 /root/.local/bin/uv /usr/local/bin/uv \
+    && install -m 0755 /root/.local/bin/uvx /usr/local/bin/uvx \
+    && rm -rf /root/.local
 
-WORKDIR /opt/car-crash-yt
-COPY pyproject.toml README.md ./
-RUN uv sync --no-dev --no-install-project
+RUN curl -fsSL https://deno.land/install.sh | sh \
+    && deno --version \
+    && ffmpeg -version \
+    && "${CC}" --version \
+    && "${CXX}" --version
 
-COPY . .
-RUN uv sync --no-dev
+RUN groupadd --gid "${APP_GID}" carcrash \
+    && useradd \
+        --uid "${APP_UID}" \
+        --gid "${APP_GID}" \
+        --create-home \
+        --shell /bin/bash \
+        carcrash
 
-RUN mkdir -p /mnt/car-crash-yt /run/secrets/car-crash-yt
+WORKDIR /app
 
-CMD ["/opt/car-crash-yt/.venv/bin/python", "main.py"]
+COPY pyproject.toml uv.lock README.md ./
+
+RUN uv python install "${PYTHON_VERSION}" \
+    && uv sync --frozen --no-dev --no-install-project
+
+COPY . /app
+
+RUN uv sync --frozen --no-dev \
+    && /opt/venv/bin/python -c \
+        "import torch; from torchcodec.decoders import VideoDecoder; print(torch.__version__)" \
+    && mkdir -p \
+        /mnt/car-crash-yt/car-crash-yt \
+        /run/config/car-crash-yt \
+        /run/secrets/car-crash-yt \
+    && rm -f /app/config /app/secret /app/cookies.txt \
+    && ln -s /run/config/car-crash-yt/config /app/config \
+    && ln -s /run/secrets/car-crash-yt/secret /app/secret \
+    && ln -s /run/secrets/car-crash-yt/cookies.txt /app/cookies.txt \
+    && chown -R "${APP_UID}:${APP_GID}" \
+        /app \
+        /mnt/car-crash-yt \
+        /opt/venv \
+        /opt/uv-python
+
+ARG BUNDLED_SECRETS_VERSION=initial
+
+RUN --mount=type=secret,id=car_crash_config,target=/tmp/car_crash_config,required=true \
+    --mount=type=secret,id=car_crash_secret,target=/tmp/car_crash_secret,required=true \
+    --mount=type=secret,id=youtube_cookies,target=/tmp/youtube_cookies,required=true \
+    test -n "${BUNDLED_SECRETS_VERSION}" \
+    && install -m 0444 -o "${APP_UID}" -g "${APP_GID}" \
+        /tmp/car_crash_config \
+        /run/config/car-crash-yt/config \
+    && install -m 0400 -o "${APP_UID}" -g "${APP_GID}" \
+        /tmp/car_crash_secret \
+        /run/secrets/car-crash-yt/secret \
+    && install -m 0600 -o "${APP_UID}" -g "${APP_GID}" \
+        /tmp/youtube_cookies \
+        /run/secrets/car-crash-yt/cookies.txt \
+    && test -s /run/config/car-crash-yt/config \
+    && test -s /run/secrets/car-crash-yt/secret \
+    && test -s /run/secrets/car-crash-yt/cookies.txt
+
+USER 20234844:20234844
+
+ENTRYPOINT ["/usr/bin/tini", "--"]
+CMD ["/opt/venv/bin/python", "main.py"]

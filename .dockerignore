@@ -1,0 +1,15 @@
+.git
+.github
+.venv
+__pycache__
+*.py[cod]
+.pytest_cache
+.ruff_cache
+data
+videos
+config
+secret
+cookies.txt
+tests
+*.log
+.DS_Store
