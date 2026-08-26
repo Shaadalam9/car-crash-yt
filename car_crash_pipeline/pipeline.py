@@ -8,8 +8,10 @@ from typing import Any, Dict
 from . import settings
 from .crash_review import (
     CRASH_REVIEW_VERSION,
+    has_location_visual_review_errors,
     has_visual_review_errors,
     reset_temp_directory,
+    run_location_visual_stage,
     run_visual_stage,
 )
 from .location import run_location_stage
@@ -48,6 +50,8 @@ def requires_processing(record: Any) -> bool:
         return False
     if has_visual_review_errors(record):
         return True
+    if has_location_visual_review_errors(record):
+        return True
     if record.get("status") not in FINAL_STATUSES:
         return True
     return record.get("visual_review_version") != CRASH_REVIEW_VERSION
@@ -73,6 +77,10 @@ def update_outputs(state: Dict[str, Any]) -> None:
 
 def run_cycle(state: Dict[str, Any], cycle: int) -> tuple[int, int, int, int]:
     log(f"Starting cycle {cycle}")
+    run_location_stage(state)
+    location_visual_processed = run_location_visual_stage(state)
+    if location_visual_processed:
+        update_outputs(state)
     discovered = discover_when_ready(state)
     text_processed = run_text_stage(state)
     visual_processed = run_visual_stage(state, after_video=update_outputs)
@@ -85,10 +93,28 @@ def run_cycle(state: Dict[str, Any], cycle: int) -> tuple[int, int, int, int]:
     )
     log(
         f"Cycle {cycle}: discovered={discovered}, text={text_processed}, "
-        f"visual={visual_processed}, accepted_segments={accepted_segments}, "
+        f"visual={visual_processed}, location_visual={location_visual_processed}, "
+        f"accepted_segments={accepted_segments}, "
         f"unfinished={unfinished}"
     )
     return discovered, text_processed, visual_processed, unfinished
+
+
+def cycle_pause_seconds(
+    discovered: int,
+    text_processed: int,
+    visual_processed: int,
+    unfinished: int,
+) -> int:
+    """Use the short pause whenever the current batch still has work."""
+    active = bool(
+        discovered or text_processed or visual_processed or unfinished
+    )
+    return (
+        settings.ACTIVE_PAUSE_SECONDS
+        if active
+        else settings.IDLE_PAUSE_SECONDS
+    )
 
 
 def main() -> None:
@@ -102,12 +128,16 @@ def main() -> None:
             discovered, text_count, visual_count, unfinished = run_cycle(state, cycle)
             if not settings.CONTINUOUS_MODE:
                 return
-            progress = any((discovered, text_count, visual_count))
-            pause = settings.ACTIVE_PAUSE_SECONDS if progress else settings.IDLE_PAUSE_SECONDS
+            pause = cycle_pause_seconds(
+                discovered, text_count, visual_count, unfinished
+            )
             if unfinished:
-                log(f"Pausing before continuing the current batch ({unfinished} unfinished)")
+                log(
+                    f"Pausing {pause} seconds before continuing the current "
+                    f"batch ({unfinished} unfinished)"
+                )
             else:
-                log("Pausing before the next discovery batch")
+                log(f"Pausing {pause} seconds before the next discovery batch")
             time.sleep(pause)
     except KeyboardInterrupt:
         update_outputs(state)

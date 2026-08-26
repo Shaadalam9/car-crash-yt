@@ -29,7 +29,29 @@ from .shared import (
 )
 
 
-CRASH_REVIEW_VERSION = "cosmos3_full_clip_crash_v1"
+CRASH_REVIEW_VERSION = "cosmos3_full_clip_crash_v3"
+LOCATION_VISUAL_REVIEW_VERSION = "cosmos3_location_text_v2"
+COMPATIBLE_REVIEW_VERSIONS = {
+    "cosmos3_full_clip_crash_v1",
+    "cosmos3_full_clip_crash_v2",
+    CRASH_REVIEW_VERSION,
+}
+CRASH_TYPES = {
+    "rear_end",
+    "side_impact",
+    "head_on",
+    "rollover",
+    "pedestrian",
+    "cyclist",
+    "multi_vehicle",
+    "single_vehicle",
+    "near_collision",
+    "other",
+    "unknown",
+}
+LOCATION_EVIDENCE_VALUES = {"metadata", "embedded_text", "both", "none"}
+SEGMENT_REVIEW_ATTEMPTS = 2
+LOCATION_REVIEW_ATTEMPTS = 2
 
 
 def _timestamp_seconds(hours: str | None, minutes: str, seconds: str) -> int:
@@ -120,11 +142,147 @@ class CrashDecision:
     error: Optional[str] = None
 
 
+@dataclass(frozen=True)
+class LocationVisualDecision:
+    location_found: bool
+    confidence: float
+    locality: Optional[str]
+    locality_aka: List[str]
+    state: Optional[str]
+    country: Optional[str]
+    lat: Optional[float]
+    lon: Optional[float]
+    visible_location_text: List[str]
+    raw_response: str
+    error: Optional[str] = None
+
+
+def normalise_location_visual_decision(
+    data: Dict[str, Any], raw_response: str
+) -> LocationVisualDecision:
+    location_found = normalise_bool(data.get("location_found"))
+    if not location_found:
+        return LocationVisualDecision(
+            location_found=False,
+            confidence=clamp_float(data.get("confidence")),
+            locality=None,
+            locality_aka=[],
+            state=None,
+            country=None,
+            lat=None,
+            lon=None,
+            visible_location_text=normalise_string_list(
+                data.get("visible_location_text")
+            ),
+            raw_response=raw_response,
+        )
+    return LocationVisualDecision(
+        location_found=True,
+        confidence=clamp_float(data.get("confidence")),
+        locality=optional_text(data.get("locality")),
+        locality_aka=normalise_string_list(data.get("locality_aka")),
+        state=optional_text(data.get("state")),
+        country=optional_text(data.get("country")),
+        lat=_normalise_coordinate(data.get("lat"), -90.0, 90.0),
+        lon=_normalise_coordinate(data.get("lon"), -180.0, 180.0),
+        visible_location_text=normalise_string_list(
+            data.get("visible_location_text")
+        ),
+        raw_response=raw_response,
+    )
+
+
+def invalid_location_visual_decision(
+    raw_response: str, error: str
+) -> LocationVisualDecision:
+    return LocationVisualDecision(
+        location_found=False,
+        confidence=0.0,
+        locality=None,
+        locality_aka=[],
+        state=None,
+        country=None,
+        lat=None,
+        lon=None,
+        visible_location_text=[],
+        raw_response=raw_response,
+        error=error,
+    )
+
+
+def _normalise_coordinate(
+    value: Any, minimum: float, maximum: float
+) -> Optional[float]:
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(result) or not minimum <= result <= maximum:
+        return None
+    return result
+
+
+def _evidence_contains(value: Any, evidence: List[str]) -> bool:
+    expected = re.sub(r"[^a-z0-9]+", " ", clean_text(value).casefold()).strip()
+    if not expected:
+        return True
+    visible = re.sub(
+        r"[^a-z0-9]+", " ", " ".join(evidence).casefold()
+    ).strip()
+    return expected in visible
+
+
+def _coordinate_appears_in_evidence(value: float, evidence: List[str]) -> bool:
+    visible = " ".join(evidence).replace("−", "-").replace("–", "-")
+    variants = {
+        f"{value:g}",
+        f"{value:.5f}".rstrip("0").rstrip("."),
+        f"{value:.6f}".rstrip("0").rstrip("."),
+        f"{value:.7f}".rstrip("0").rstrip("."),
+    }
+    return any(candidate and candidate in visible for candidate in variants)
+
+
+def validate_location_visual_response(data: Dict[str, Any]) -> Optional[str]:
+    if not isinstance(data.get("location_found"), bool):
+        return "location_found_must_be_boolean"
+    try:
+        confidence = float(data.get("confidence"))
+    except (TypeError, ValueError):
+        return "confidence_must_be_numeric"
+    if not math.isfinite(confidence) or not 0.0 < confidence <= 1.0:
+        return "confidence_must_be_greater_than_zero_and_at_most_one"
+    lat = _normalise_coordinate(data.get("lat"), -90.0, 90.0)
+    lon = _normalise_coordinate(data.get("lon"), -180.0, 180.0)
+    if (lat is None) != (lon is None):
+        return "latitude_and_longitude_must_be_a_valid_pair"
+    if data["location_found"]:
+        evidence = normalise_string_list(data.get("visible_location_text"))
+        if not evidence:
+            return "found_location_requires_visible_location_text"
+        fields = [
+            optional_text(data.get("locality")),
+            optional_text(data.get("state")),
+            optional_text(data.get("country")),
+        ]
+        if not any(fields) and lat is None:
+            return "found_location_requires_place_fields_or_coordinates"
+        for value in fields:
+            if value and not _evidence_contains(value, evidence):
+                return "structured_location_must_appear_in_visible_text"
+        if lat is not None and (
+            not _coordinate_appears_in_evidence(lat, evidence)
+            or not _coordinate_appears_in_evidence(lon, evidence)
+        ):
+            return "coordinate_pair_must_appear_in_visible_text"
+    return None
+
+
 def normalise_crash_decision(
     data: Dict[str, Any], raw_response: str, segment_duration: float
 ) -> CrashDecision:
     confidence = clamp_float(data.get("confidence"))
-    is_crash = normalise_bool(data.get("is_crash")) and confidence >= settings.MIN_CRASH_CONFIDENCE
+    is_crash = normalise_bool(data.get("is_crash"))
     impact: Optional[float]
     try:
         candidate = float(data.get("impact_time_seconds"))
@@ -140,7 +298,7 @@ def normalise_crash_decision(
         count = None
 
     location_evidence = clean_text(data.get("location_evidence") or "none").lower()
-    if location_evidence not in {"metadata", "embedded_text", "both", "none"}:
+    if location_evidence not in LOCATION_EVIDENCE_VALUES:
         location_evidence = "none"
     if location_evidence == "none":
         locality = state_name = country = None
@@ -198,15 +356,124 @@ def invalid_crash_decision(raw_response: str, error: str) -> CrashDecision:
     )
 
 
+def validate_crash_response(data: Dict[str, Any]) -> Optional[str]:
+    """Return a retry reason when a model answer is syntactically valid but unusable."""
+    if not isinstance(data.get("is_crash"), bool):
+        return "is_crash_must_be_boolean"
+
+    try:
+        confidence = float(data.get("confidence"))
+    except (TypeError, ValueError):
+        return "confidence_must_be_numeric"
+    if not math.isfinite(confidence) or not 0.0 < confidence <= 1.0:
+        return "confidence_must_be_greater_than_zero_and_at_most_one"
+
+    crash_type = clean_text(data.get("crash_type") or "unknown").lower()
+    if crash_type not in CRASH_TYPES:
+        return "crash_type_must_be_one_allowed_value"
+    if not data["is_crash"] and crash_type != "unknown":
+        return "non_crash_response_must_use_unknown_crash_type"
+
+    impact_time = data.get("impact_time_seconds")
+    if not data["is_crash"] and impact_time is not None:
+        return "non_crash_response_must_not_have_impact_time"
+
+    return None
+
+
+def saved_segment_retry_reason(review: Dict[str, Any]) -> Optional[str]:
+    """Return why a saved segment review must be regenerated, if applicable."""
+    if normalise_bool(review.get("retry_exhausted")):
+        return None
+    error = optional_text(review.get("error"))
+    if error:
+        return error
+
+    raw_response = str(review.get("raw_response") or "")
+    data = recover_json(raw_response)
+    if data is None:
+        return "missing_or_invalid_raw_response"
+    return validate_crash_response(data)
+
+
+def is_accepted_crash_review(review: Dict[str, Any]) -> bool:
+    """Apply the acceptance threshold without changing the model's Boolean answer."""
+    return normalise_bool(review.get("is_crash")) and clamp_float(
+        review.get("confidence")
+    ) >= settings.MIN_CRASH_CONFIDENCE
+
+
 def has_visual_review_errors(record: Dict[str, Any]) -> bool:
     """Return whether a saved visual review contains retryable errors."""
+    boundary_reviews = record.get("boundary_reviews", [])
+    if isinstance(boundary_reviews, list) and any(
+        isinstance(item, dict) and item.get("error") for item in boundary_reviews
+    ):
+        return True
+
+    segment_reviews = record.get("segment_reviews", [])
+    if isinstance(segment_reviews, list) and any(
+        isinstance(item, dict) and saved_segment_retry_reason(item)
+        for item in segment_reviews
+    ):
+        return True
+    return False
+
+
+def _terminalise_visual_review_errors(record: Dict[str, Any]) -> int:
+    """Convert persistent review errors into nonblocking terminal warnings."""
+    skipped = 0
     for field in ("boundary_reviews", "segment_reviews"):
         reviews = record.get(field, [])
-        if isinstance(reviews, list) and any(
-            isinstance(item, dict) and item.get("error") for item in reviews
-        ):
-            return True
-    return False
+        if not isinstance(reviews, list):
+            continue
+        for review in reviews:
+            if not isinstance(review, dict) or not review.get("error"):
+                continue
+            review["terminal_error"] = str(review["error"])
+            review["error"] = None
+            review["retry_exhausted"] = True
+            skipped += 1
+    return skipped
+
+
+def _set_visual_review_status(
+    record: Dict[str, Any],
+    *,
+    accepted_count: int,
+    boundary_error_count: int,
+    segment_error_count: int,
+) -> Optional[str]:
+    """Update status and stop persistent model errors from blocking the queue."""
+    if not boundary_error_count and not segment_error_count:
+        record["visual_retry_cycles"] = 0
+        record["status"] = "complete" if accepted_count else "visual_rejected"
+        record["error"] = None
+        return None
+
+    try:
+        retry_cycles = max(0, int(record.get("visual_retry_cycles", 0))) + 1
+    except (TypeError, ValueError):
+        retry_cycles = 1
+    record["visual_retry_cycles"] = retry_cycles
+    if retry_cycles < settings.MAX_REVIEW_CYCLES:
+        record["status"] = "visual_error"
+        record["error"] = (
+            f"Retry required for {boundary_error_count} boundary reviews and "
+            f"{segment_error_count} segment reviews "
+            f"(cycle {retry_cycles}/{settings.MAX_REVIEW_CYCLES})"
+        )
+        return None
+
+    skipped = _terminalise_visual_review_errors(record)
+    record["status"] = "complete" if accepted_count else "visual_rejected"
+    record["error"] = None
+    warning = (
+        f"Skipped {skipped} persistently invalid reviews after "
+        f"{retry_cycles} cycles"
+    )
+    record["visual_review_warning"] = warning
+    return warning
 
 
 def _boundary_decision_from_record(value: Dict[str, Any]) -> BoundaryDecision:
@@ -296,8 +563,8 @@ edit. Be conservative: accept only direct temporal evidence of an edit.
 Return JSON only:
 {{
   "is_edit_boundary": true,
-  "confidence": 0.0,
-  "transition_type": "hard_cut|fade|wipe|title_card|other|none",
+  "confidence": 0.95,
+  "transition_type": "hard_cut",
   "short_reason": "one factual sentence"
 }}
 """.strip()
@@ -334,20 +601,111 @@ Return JSON only:
         segment: FullSegment,
         sample_fps: float,
     ) -> CrashDecision:
-        prompt = self._segment_prompt(metadata, segment.duration)
-        try:
-            answer = self._generate(sample_path, prompt, sample_fps)
-            data = recover_json(answer)
-            if data is None:
-                return invalid_crash_decision(answer, "json_recovery_failed")
-            return normalise_crash_decision(data, answer, segment.duration)
-        except Exception as exc:
-            return invalid_crash_decision("", f"model_error: {exc}")
+        base_prompt = self._segment_prompt(metadata, segment.duration)
+        prompt = base_prompt
+        answer = ""
+        last_error = "model_did_not_return_a_usable_decision"
+        for attempt in range(SEGMENT_REVIEW_ATTEMPTS):
+            try:
+                answer = self._generate(sample_path, prompt, sample_fps)
+                data = recover_json(answer)
+                if data is None:
+                    last_error = "json_recovery_failed"
+                else:
+                    validation_error = validate_crash_response(data)
+                    if validation_error is None:
+                        return normalise_crash_decision(
+                            data, answer, segment.duration
+                        )
+                    last_error = f"semantic_error: {validation_error}"
+            except Exception as exc:
+                last_error = f"model_error: {exc}"
+
+            if attempt + 1 < SEGMENT_REVIEW_ATTEMPTS:
+                prompt = (
+                    base_prompt
+                    + "\n\nYour previous answer was invalid because: "
+                    + last_error
+                    + ". Reconsider the video and return one corrected JSON object."
+                )
+        return invalid_crash_decision(answer, last_error)
+
+    def review_location(
+        self,
+        sample_path: Path,
+        sample_fps: float,
+    ) -> LocationVisualDecision:
+        base_prompt = self._location_prompt()
+        prompt = base_prompt
+        answer = ""
+        last_error = "model_did_not_return_a_usable_location_decision"
+        for attempt in range(LOCATION_REVIEW_ATTEMPTS):
+            try:
+                answer = self._generate(sample_path, prompt, sample_fps)
+                data = recover_json(answer)
+                if data is None:
+                    last_error = "json_recovery_failed"
+                else:
+                    validation_error = validate_location_visual_response(data)
+                    if validation_error is None:
+                        return normalise_location_visual_decision(data, answer)
+                    last_error = f"semantic_error: {validation_error}"
+            except Exception as exc:
+                last_error = f"model_error: {exc}"
+
+            if attempt + 1 < LOCATION_REVIEW_ATTEMPTS:
+                prompt = (
+                    base_prompt
+                    + "\n\nYour previous answer was invalid because: "
+                    + last_error
+                    + ". Reinspect the video and return one corrected JSON object."
+                )
+        return invalid_location_visual_decision(answer, last_error)
+
+    @staticmethod
+    def _location_prompt() -> str:
+        return """
+Inspect the complete source clip only for explicit geographic information.
+Carefully read text overlays in every corner, title cards, captions, creator
+annotations, street signs, motorway signs, business signs, and other readable
+text inside the video. Location overlays can be small and may appear for only
+part of the clip.
+
+Return a location only when it is directly supported by readable text. Do not
+infer a place from scenery, language, flags, number plates, road design,
+architecture, weather, or general appearance. Transcribe the supporting text
+exactly in visible_location_text. Separate a city or locality from its state or
+province when possible. Leave country null when the visible text does not name
+it. locality_aka contains only alternative locality names that are explicitly
+visible.
+
+If a latitude and longitude pair is visibly written in the clip, transcribe it
+as decimal numbers in lat and lon and also preserve the exact coordinate text
+in visible_location_text. Do not estimate coordinates from the scene. Both
+coordinates must be clearly readable; otherwise set both to null.
+
+The confidence value is certainty that the location reading is correct. If no
+explicit geographic text is clearly readable, or if any letters or digits are
+ambiguous, use location_found=false with high confidence and null location
+fields. Prefer an unknown result over guessing.
+
+Return JSON only:
+{
+  "location_found": false,
+  "confidence": 0.99,
+  "locality": null,
+  "locality_aka": [],
+  "state": null,
+  "country": null,
+  "lat": null,
+  "lon": null,
+  "visible_location_text": []
+}
+""".strip()
 
     @staticmethod
     def _segment_prompt(metadata: Dict[str, Any], duration: float) -> str:
         title = clean_text(metadata.get("title"))
-        description = clean_text(metadata.get("description"))[:2500]
         return f"""
 This sample represents the full temporal span of one edit-bounded source clip
 from a YouTube video. The source clip lasts {duration:.3f} seconds. Frames may
@@ -364,35 +722,64 @@ intent, identity, or legal responsibility. Use "unknown" when an attribute is
 not visible. impact_time_seconds is relative to this source clip, not the full
 YouTube upload. Use null when an impact is absent or cannot be timed.
 
-Location fields may use the supplied title or description or readable embedded
-text. Do not infer a place from architecture, language, plates, road design, or
-general appearance. Set location_evidence to none if there is no explicit
-support.
+Location fields may use only readable text visibly embedded in this source
+clip. Metadata location evidence is processed separately. Do not infer a place
+from architecture, language, plates, road design, or general appearance. Set
+location_evidence to none if there is no explicit visible support.
 
-YouTube title: {title}
-YouTube description: {description}
+The confidence value is your certainty that the is_crash Boolean decision is
+correct. It is not the probability that a crash occurred. A clearly visible
+non-crash clip should therefore use is_crash=false with high confidence. Never
+use zero confidence; zero means the answer is unusable and will be retried.
+
+The fields must be logically consistent:
+* Use is_crash=true and crash_type=near_collision when evasive action narrowly
+  prevents an impact.
+* Use crash_type=unknown and impact_time_seconds=null when is_crash=false.
+* Select exactly one allowed value for every categorical field. Never copy a
+  list of choices or the | character into a value.
+* embedded_location_text contains only short geographic text visibly present
+  inside the video frames. Never copy titles, descriptions, URLs, email
+  addresses, channel names, promotional text, or attribution lists into it.
+* Keep the complete JSON response under 500 tokens. road_users must contain
+  unique road user types rather than one repeated entry per vehicle. Include at
+  most five short embedded_location_text items.
+
+Upload title for crash context only: {title}
 
 Return JSON only:
 {{
   "is_crash": true,
-  "confidence": 0.0,
+  "confidence": 0.95,
   "impact_time_seconds": null,
   "short_description": "one factual sentence",
-  "crash_type": "rear_end|side_impact|head_on|rollover|pedestrian|cyclist|multi_vehicle|single_vehicle|near_collision|other|unknown",
-  "camera_view": "dashcam|cctv|handheld|action_camera|broadcast|other|unknown",
+  "crash_type": "near_collision",
+  "camera_view": "dashcam",
   "road_user_count": null,
   "road_users": ["car"],
-  "road_environment": "urban|rural|motorway|junction|parking|other|unknown",
-  "time_of_day": "day|night|dawn_dusk|unknown",
-  "weather": "clear|rain|snow|fog|other|unknown",
-  "road_condition": "dry|wet|snow_ice|other|unknown",
-  "visible_outcomes": ["vehicle stopped"],
+  "road_environment": "motorway",
+  "time_of_day": "day",
+  "weather": "clear",
+  "road_condition": "dry",
+  "visible_outcomes": ["evasive manoeuvre"],
   "embedded_location_text": [],
   "locality": null,
   "state": null,
   "country": null,
-  "location_evidence": "metadata|embedded_text|both|none"
+  "location_evidence": "none"
 }}
+
+Allowed crash_type values: rear_end, side_impact, head_on, rollover,
+pedestrian, cyclist, multi_vehicle, single_vehicle, near_collision, other,
+unknown.
+Allowed camera_view values: dashcam, cctv, handheld, action_camera, broadcast,
+other, unknown.
+Allowed road_environment values: urban, rural, motorway, junction, parking,
+other, unknown.
+Allowed time_of_day values: day, night, dawn_dusk, unknown.
+Allowed weather values: clear, rain, snow, fog, other, unknown.
+Allowed road_condition values: dry, wet, snow_ice, other, unknown.
+Allowed location_evidence values: metadata, embedded_text, both, none.
 """.strip()
 
 
@@ -567,10 +954,16 @@ def _create_segment_sample(video_path: Path, segment: FullSegment, destination: 
         "-t",
         f"{segment.duration:.6f}",
         "-vf",
-        f"fps={sample_fps:.8g},scale={settings.SAMPLE_WIDTH}:-2:flags=fast_bilinear",
+        (
+            f"fps={sample_fps:.8g},"
+            f"scale={settings.SAMPLE_WIDTH}:-2:flags=fast_bilinear,"
+            "setpts=PTS-STARTPTS"
+        ),
         "-an",
         "-c:v",
         "libx264",
+        "-bf",
+        "0",
         "-preset",
         "veryfast",
         "-crf",
@@ -585,6 +978,262 @@ def _create_segment_sample(video_path: Path, segment: FullSegment, destination: 
         label="failed to create full segment sample",
     )
     return destination, sample_fps
+
+
+def _create_location_sample(
+    video_path: Path, segment: FullSegment, destination: Path
+) -> tuple[Path, float]:
+    """Create a higher resolution full segment sample for reading small text."""
+    sample_fps = min(
+        settings.LOCATION_SAMPLE_MAX_FPS,
+        max(
+            0.01,
+            settings.LOCATION_SAMPLE_FRAME_COUNT / max(segment.duration, 0.001),
+        ),
+    )
+    command = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-nostdin",
+        "-ss",
+        f"{segment.start_time:.6f}",
+        "-i",
+        str(video_path),
+        "-t",
+        f"{segment.duration:.6f}",
+        "-vf",
+        (
+            f"fps={sample_fps:.8g},"
+            f"scale={settings.LOCATION_SAMPLE_WIDTH}:-2:flags=lanczos,"
+            "setpts=PTS-STARTPTS"
+        ),
+        "-an",
+        "-c:v",
+        "libx264",
+        "-bf",
+        "0",
+        "-preset",
+        "veryfast",
+        "-crf",
+        "23",
+        "-y",
+        str(destination),
+    ]
+    _run_sample_command(
+        command,
+        destination,
+        timeout=600,
+        label="failed to create location sample",
+    )
+    return destination, sample_fps
+
+
+def _location_is_resolved(segment: Dict[str, Any]) -> bool:
+    location = segment.get("location")
+    return (
+        isinstance(location, dict)
+        and location.get("geocode_status") == "resolved"
+        and optional_text(location.get("locality")) is not None
+    )
+
+
+def _has_structured_location(segment: Dict[str, Any]) -> bool:
+    return optional_text(segment.get("locality")) is not None
+
+
+def _location_review_is_current(segment: Dict[str, Any]) -> bool:
+    review = segment.get("location_visual_review")
+    return (
+        segment.get("location_visual_review_version")
+        == LOCATION_VISUAL_REVIEW_VERSION
+        and isinstance(review, dict)
+        and not review.get("error")
+    )
+
+
+def _needs_location_visual_review(segment: Dict[str, Any]) -> bool:
+    saved_version = optional_text(segment.get("location_visual_review_version"))
+    if saved_version and saved_version != LOCATION_VISUAL_REVIEW_VERSION:
+        return True
+    review = segment.get("location_visual_review")
+    if (
+        saved_version == LOCATION_VISUAL_REVIEW_VERSION
+        and isinstance(review, dict)
+        and review.get("error")
+    ):
+        return True
+    if _location_is_resolved(segment) or _has_structured_location(segment):
+        return False
+    return not _location_review_is_current(segment)
+
+
+def has_location_visual_review_errors(record: Dict[str, Any]) -> bool:
+    return any(
+        isinstance(segment, dict)
+        and isinstance(segment.get("location_visual_review"), dict)
+        and bool(segment["location_visual_review"].get("error"))
+        for segment in record.get("segments", [])
+    )
+
+
+def _delete_downloaded_video_when_finished(
+    record: Dict[str, Any], video_path: Path
+) -> bool:
+    if (
+        not settings.DELETE_VIDEO_AFTER_PROCESSING
+        or record.get("status") == "visual_error"
+        or has_location_visual_review_errors(record)
+    ):
+        return False
+    video_path.unlink(missing_ok=True)
+    record["downloaded_path"] = None
+    log(f"Deleted reviewed video: {video_path}")
+    return True
+
+
+def _restore_pre_location_visual_evidence(segment: Dict[str, Any]) -> None:
+    """Remove old visual location data and restore the crash review evidence."""
+    raw = recover_json(str(segment.get("raw_response") or "")) or {}
+    evidence = clean_text(raw.get("location_evidence") or "none").lower()
+    if evidence not in LOCATION_EVIDENCE_VALUES:
+        evidence = "none"
+    segment["embedded_location_text"] = normalise_string_list(
+        raw.get("embedded_location_text")
+    )
+    segment["location_evidence"] = evidence
+    if evidence == "none":
+        segment["locality"] = None
+        segment["state"] = None
+        segment["country"] = None
+    else:
+        segment["locality"] = optional_text(raw.get("locality"))
+        segment["state"] = optional_text(raw.get("state"))
+        segment["country"] = optional_text(raw.get("country"))
+    segment["locality_aka"] = normalise_string_list(raw.get("locality_aka"))
+    segment["lat"] = _normalise_coordinate(raw.get("lat"), -90.0, 90.0)
+    segment["lon"] = _normalise_coordinate(raw.get("lon"), -180.0, 180.0)
+    segment.pop("location", None)
+
+
+def _apply_location_visual_decision(
+    segment: Dict[str, Any], decision: LocationVisualDecision
+) -> None:
+    segment["location_visual_review"] = asdict(decision)
+    segment["location_visual_review_version"] = LOCATION_VISUAL_REVIEW_VERSION
+    if (
+        decision.error
+        or not decision.location_found
+        or decision.confidence < settings.MIN_LOCATION_CONFIDENCE
+    ):
+        return
+
+    segment["embedded_location_text"] = normalise_string_list(
+        [
+            *normalise_string_list(segment.get("embedded_location_text")),
+            *decision.visible_location_text,
+        ]
+    )
+    segment["locality"] = decision.locality
+    segment["locality_aka"] = decision.locality_aka
+    segment["state"] = decision.state
+    segment["country"] = decision.country
+    segment["lat"] = decision.lat
+    segment["lon"] = decision.lon
+    previous_evidence = clean_text(segment.get("location_evidence")).lower()
+    segment["location_evidence"] = (
+        "both" if previous_evidence == "metadata" else "embedded_text"
+    )
+    segment.pop("location", None)
+
+
+def _store_location_visual_decision(
+    segment: Dict[str, Any],
+    decision: LocationVisualDecision,
+    previous_cycles: int,
+) -> bool:
+    """Store a location decision and terminalise it after the retry budget."""
+    _apply_location_visual_decision(segment, decision)
+    current_review = segment["location_visual_review"]
+    current_review["review_cycles"] = previous_cycles + 1
+    if (
+        current_review.get("error")
+        and current_review["review_cycles"] >= settings.MAX_REVIEW_CYCLES
+    ):
+        current_review["terminal_error"] = str(current_review["error"])
+        current_review["error"] = None
+        current_review["retry_exhausted"] = True
+        return True
+    return False
+
+
+def review_missing_segment_locations(
+    video_id: str,
+    record: Dict[str, Any],
+    judge: CosmosCrashJudge,
+    video_path: Path,
+) -> int:
+    """Read location overlays from accepted segments that remain unresolved."""
+    pending = [
+        segment
+        for segment in record.get("segments", [])
+        if isinstance(segment, dict) and _needs_location_visual_review(segment)
+    ]
+    if not pending:
+        return 0
+
+    log(f"Reviewing visible location text in {len(pending)} segments for {video_id}")
+    reviewed = 0
+    with tempfile.TemporaryDirectory(
+        prefix="location-review-", dir=settings.DATA_DIR
+    ) as temporary:
+        work = Path(temporary)
+        for position, segment in enumerate(pending, start=1):
+            previous_review = segment.get("location_visual_review")
+            previous_cycles = 0
+            if isinstance(previous_review, dict):
+                try:
+                    previous_cycles = max(
+                        0, int(previous_review.get("review_cycles", 0))
+                    )
+                except (TypeError, ValueError):
+                    previous_cycles = 0
+            saved_version = optional_text(
+                segment.get("location_visual_review_version")
+            )
+            if saved_version and saved_version != LOCATION_VISUAL_REVIEW_VERSION:
+                _restore_pre_location_visual_evidence(segment)
+            try:
+                full_segment = FullSegment(
+                    start_time=float(segment.get("start_time")),
+                    end_time=float(segment.get("end_time")),
+                )
+                sample, sample_fps = _create_location_sample(
+                    video_path,
+                    full_segment,
+                    work
+                    / f"location-{int(segment.get('segment_index', position)):05d}.mp4",
+                )
+                decision = judge.review_location(sample, sample_fps)
+            except Exception as exc:
+                decision = invalid_location_visual_decision(
+                    "", f"sample_error: {exc}"
+                )
+            if _store_location_visual_decision(
+                segment, decision, previous_cycles
+            ):
+                log(
+                    "Skipping location review after persistent failures for "
+                    f"{video_id} segment {segment.get('segment_index')}"
+                )
+            reviewed += 1
+            if position == 1 or position % 10 == 0 or position == len(pending):
+                log(
+                    f"Location review progress for {video_id}: "
+                    f"{position}/{len(pending)}"
+                )
+    return reviewed
 
 
 def analyse_video(video_id: str, record: Dict[str, Any], judge: CosmosCrashJudge) -> Dict[str, Any]:
@@ -607,7 +1256,7 @@ def analyse_video(video_id: str, record: Dict[str, Any], judge: CosmosCrashJudge
     boundary_reviews: List[BoundaryDecision] = []
     saved_boundaries = record.get("boundary_reviews")
     can_resume = (
-        record.get("visual_review_version") == CRASH_REVIEW_VERSION
+        record.get("visual_review_version") in COMPATIBLE_REVIEW_VERSIONS
         and isinstance(saved_boundaries, list)
         and bool(saved_boundaries)
     )
@@ -691,7 +1340,10 @@ def analyse_video(video_id: str, record: Dict[str, Any], judge: CosmosCrashJudge
             if not isinstance(saved_segments, list):
                 saved_segments = []
             for item in saved_segments:
-                if not isinstance(item, dict) or item.get("error"):
+                if (
+                    not isinstance(item, dict)
+                    or saved_segment_retry_reason(item) is not None
+                ):
                     continue
                 try:
                     reusable_reviews[
@@ -760,7 +1412,7 @@ def analyse_video(video_id: str, record: Dict[str, Any], judge: CosmosCrashJudge
                         f"{completed_segments}/{pending_segment_count}"
                     )
             all_reviews.append(review)
-            if normalise_bool(review.get("is_crash")):
+            if is_accepted_crash_review(review):
                 if review.get("impact_time_seconds") is not None:
                     review["impact_time_in_video"] = round(
                         segment.start_time + float(review["impact_time_seconds"]), 3
@@ -777,18 +1429,17 @@ def analyse_video(video_id: str, record: Dict[str, Any], judge: CosmosCrashJudge
     record["visual_review_version"] = CRASH_REVIEW_VERSION
     boundary_error_count = sum(bool(item.error) for item in boundary_reviews)
     segment_error_count = sum(bool(item.get("error")) for item in all_reviews)
-    if boundary_error_count or segment_error_count:
-        record["status"] = "visual_error"
-        record["error"] = (
-            f"Retry required for {boundary_error_count} boundary reviews and "
-            f"{segment_error_count} segment reviews"
-        )
-    else:
-        record["status"] = "complete" if accepted else "visual_rejected"
-        record["error"] = None
-    if settings.DELETE_VIDEO_AFTER_PROCESSING and record["status"] != "visual_error":
-        video_path.unlink(missing_ok=True)
-        record["downloaded_path"] = None
+    warning = _set_visual_review_status(
+        record,
+        accepted_count=len(accepted),
+        boundary_error_count=boundary_error_count,
+        segment_error_count=segment_error_count,
+    )
+    if warning:
+        log(f"{video_id}: {warning}")
+    if record["status"] == "complete":
+        review_missing_segment_locations(video_id, record, judge, video_path)
+    _delete_downloaded_video_when_finished(record, video_path)
     return record
 
 
@@ -829,3 +1480,60 @@ def run_visual_stage(state: Dict[str, Any], after_video: Optional[Any] = None) -
     finally:
         unload_model(judge)
     return processed
+
+
+def run_location_visual_stage(state: Dict[str, Any]) -> int:
+    """Reopen retained videos to recover missed location overlays."""
+    pending_records: List[tuple[str, Dict[str, Any], Path]] = []
+    finished_records: List[tuple[Dict[str, Any], Path]] = []
+    for video_id, record in state.get("videos", {}).items():
+        if (
+            not isinstance(record, dict)
+            or record.get("status") not in {"complete", "visual_rejected"}
+        ):
+            continue
+        stored_path = optional_text(record.get("downloaded_path"))
+        if not stored_path:
+            continue
+        video_path = Path(stored_path)
+        if not video_path.is_file():
+            continue
+        needs_location_review = record.get("status") == "complete" and any(
+            isinstance(segment, dict) and _needs_location_visual_review(segment)
+            for segment in record.get("segments", [])
+        )
+        if needs_location_review:
+            pending_records.append((video_id, record, video_path))
+        else:
+            finished_records.append((record, video_path))
+
+    deleted_finished_video = False
+    for record, video_path in finished_records:
+        deleted_finished_video = (
+            _delete_downloaded_video_when_finished(record, video_path)
+            or deleted_finished_video
+        )
+    if deleted_finished_video:
+        save_state(settings.STATE_JSON, state)
+
+    if not pending_records:
+        return 0
+
+    judge = CosmosCrashJudge()
+    reviewed = 0
+    try:
+        for video_id, record, video_path in pending_records:
+            try:
+                reviewed += review_missing_segment_locations(
+                    video_id, record, judge, video_path
+                )
+            except KeyboardInterrupt:
+                save_state(settings.STATE_JSON, state)
+                raise
+            except Exception as exc:
+                log(f"Location visual processing failed for {video_id}: {exc}")
+            _delete_downloaded_video_when_finished(record, video_path)
+            save_state(settings.STATE_JSON, state)
+    finally:
+        unload_model(judge)
+    return reviewed

@@ -6,7 +6,7 @@ import json
 import re
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List
 from urllib.parse import urlencode
 from urllib.request import urlopen
 
@@ -57,16 +57,49 @@ class YouTubeDiscovery:
 
     def discover(self, state: Dict[str, Any]) -> int:
         existing = state.setdefault("videos", {})
+        discovery_state = state.setdefault("discovery", {})
+        query_cursors = discovery_state.get("query_cursors")
+        if not isinstance(query_cursors, dict):
+            query_cursors = {}
+
         candidate_ids: List[str] = []
+        overflow_ids: List[str] = []
+        queued_ids = discovery_state.get("pending_candidate_ids", [])
+        if not isinstance(queued_ids, list):
+            queued_ids = []
+
+        def add_candidate(video_id: Any) -> None:
+            value = clean_text(video_id)
+            if (
+                not re.fullmatch(r"[A-Za-z0-9_-]{11}", value)
+                or value in existing
+                or value in candidate_ids
+                or value in overflow_ids
+            ):
+                return
+            if len(candidate_ids) < settings.MAX_NEW_CANDIDATES:
+                candidate_ids.append(value)
+            else:
+                overflow_ids.append(value)
+
         for video_id in settings.SEED_VIDEO_IDS:
             if not re.fullmatch(r"[A-Za-z0-9_-]{11}", video_id):
                 raise ValueError(f"Invalid YouTube video ID in SEED_VIDEO_IDS: {video_id}")
-            if video_id not in existing and video_id not in candidate_ids:
-                candidate_ids.append(video_id)
+            add_candidate(video_id)
+        for video_id in queued_ids:
+            add_candidate(video_id)
         queries_used: List[str] = []
 
         for query in settings.DISCOVERY_QUERIES:
-            token: Optional[str] = None
+            if len(candidate_ids) >= settings.MAX_NEW_CANDIDATES:
+                break
+            cursor = query_cursors.get(query)
+            if not isinstance(cursor, dict):
+                cursor = {}
+            token = clean_text(cursor.get("next_page_token")) or None
+            pages_fetched = cursor.get("pages_fetched", 0)
+            if not isinstance(pages_fetched, int) or pages_fetched < 0:
+                pages_fetched = 0
             queries_used.append(query)
             for _ in range(settings.MAX_PAGES_PER_QUERY):
                 parameters: Dict[str, Any] = {
@@ -81,13 +114,16 @@ class YouTubeDiscovery:
                 payload = _request("search", parameters, self.api_keys)
                 for item in payload.get("items", []):
                     video_id = item.get("id", {}).get("videoId")
-                    if video_id and video_id not in existing and video_id not in candidate_ids:
-                        candidate_ids.append(video_id)
-                    if len(candidate_ids) >= settings.MAX_NEW_CANDIDATES:
-                        break
+                    add_candidate(video_id)
+                token = clean_text(payload.get("nextPageToken")) or None
+                pages_fetched += 1
+                query_cursors[query] = {
+                    "next_page_token": token,
+                    "pages_fetched": pages_fetched,
+                    "exhausted": token is None,
+                }
                 if len(candidate_ids) >= settings.MAX_NEW_CANDIDATES:
                     break
-                token = payload.get("nextPageToken")
                 if not token:
                     break
             if len(candidate_ids) >= settings.MAX_NEW_CANDIDATES:
@@ -128,6 +164,8 @@ class YouTubeDiscovery:
             "last_completed_at": now,
             "queries": queries_used,
             "new_candidates": len(candidate_ids),
+            "pending_candidate_ids": overflow_ids,
+            "query_cursors": query_cursors,
         }
         save_state(settings.STATE_JSON, state)
         log(f"Discovered {len(candidate_ids)} new videos")

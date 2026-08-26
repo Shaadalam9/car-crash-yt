@@ -55,6 +55,20 @@ def integer(name: str, minimum: int = 0, maximum: Optional[int] = None) -> int:
     return value
 
 
+def integer_or(
+    name: str,
+    default: int,
+    minimum: int = 0,
+    maximum: Optional[int] = None,
+) -> int:
+    if name not in _CONFIG:
+        value = default
+        if value < minimum or (maximum is not None and value > maximum):
+            raise ValueError(f"Default {name} is outside the allowed range")
+        return value
+    return integer(name, minimum, maximum)
+
+
 def number(
     name: str, minimum: float = 0.0, maximum: Optional[float] = None
 ) -> float:
@@ -65,6 +79,20 @@ def number(
     if result < minimum or (maximum is not None and result > maximum):
         raise ValueError(f"{name} is outside the allowed range")
     return result
+
+
+def number_or(
+    name: str,
+    default: float,
+    minimum: float = 0.0,
+    maximum: Optional[float] = None,
+) -> float:
+    if name not in _CONFIG:
+        value = float(default)
+        if value < minimum or (maximum is not None and value > maximum):
+            raise ValueError(f"Default {name} is outside the allowed range")
+        return value
+    return number(name, minimum, maximum)
 
 
 def text_list(name: str) -> List[str]:
@@ -100,6 +128,10 @@ if not DATA_DIR.is_absolute():
     DATA_DIR = ROOT / DATA_DIR
 STATE_JSON = DATA_DIR / text("STATE_JSON")
 OUTPUT_CSV = DATA_DIR / text("OUTPUT_CSV")
+_mapping_csv_name = _CONFIG.get("MAPPING_CSV", "mapping.csv")
+if not isinstance(_mapping_csv_name, str) or not _mapping_csv_name.strip():
+    raise ValueError("MAPPING_CSV must be a nonempty string")
+MAPPING_CSV = DATA_DIR / _mapping_csv_name.strip()
 VIDEO_DIR = DATA_DIR / text("VIDEO_DIR")
 TEMP_DIR = VIDEO_DIR / ".tmp"
 GEOCODE_CACHE = DATA_DIR / text("GEOCODE_CACHE")
@@ -130,6 +162,14 @@ SAMPLE_FRAME_COUNT = integer("SAMPLE_FRAME_COUNT", 4)
 SAMPLE_MAX_FPS = number("SAMPLE_MAX_FPS", 0.1)
 SAMPLE_WIDTH = integer("SAMPLE_WIDTH", 224)
 BOUNDARY_CONTEXT_SECONDS = number("BOUNDARY_CONTEXT_SECONDS", 0.5)
+LOCATION_SAMPLE_FRAME_COUNT = integer_or("LOCATION_SAMPLE_FRAME_COUNT", 16, 4)
+LOCATION_SAMPLE_WIDTH = integer_or("LOCATION_SAMPLE_WIDTH", 960, 320)
+LOCATION_SAMPLE_MAX_FPS = number_or("LOCATION_SAMPLE_MAX_FPS", 2.0, 0.1)
+MIN_LOCATION_CONFIDENCE = max(
+    0.90,
+    number_or("MIN_LOCATION_CONFIDENCE", 0.90, 0.0, 1.0),
+)
+MAX_REVIEW_CYCLES = integer_or("MAX_REVIEW_CYCLES", 3, 1, 20)
 
 CUT_BACKEND = text("CUT_BACKEND").lower()
 if CUT_BACKEND not in {"auto", "ffmpeg_cuda", "ffmpeg_cpu"}:
