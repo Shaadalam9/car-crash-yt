@@ -66,7 +66,17 @@ def discover_when_ready(state: Dict[str, Any]) -> int:
     if unfinished:
         log(f"Continuing {unfinished} unfinished videos before new discovery")
         return 0
-    return YouTubeDiscovery(load_api_keys()).discover(state)
+    try:
+        discovered = YouTubeDiscovery(load_api_keys()).discover(state)
+    except RuntimeError as exc:
+        discovery = state.setdefault("discovery", {})
+        discovery["last_error"] = str(exc)
+        save_state(settings.STATE_JSON, state)
+        log(f"YouTube discovery deferred: {exc}")
+        return 0
+    discovery = state.setdefault("discovery", {})
+    discovery["last_error"] = None
+    return discovered
 
 
 def update_outputs(state: Dict[str, Any]) -> None:
