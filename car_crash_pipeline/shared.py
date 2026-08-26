@@ -107,6 +107,47 @@ def normalise_string_list(value: Any) -> List[str]:
     return result
 
 
+def coordinates_with_hemispheres(
+    lat: Optional[float],
+    lon: Optional[float],
+    evidence: Any,
+) -> tuple[Optional[float], Optional[float]]:
+    """Apply visible N/S/E/W markers to an extracted coordinate pair."""
+    texts = normalise_string_list(evidence)
+
+    def directed(
+        value: Optional[float], positive: str, negative: str
+    ) -> Optional[float]:
+        if value is None:
+            return None
+        patterns = (
+            rf"(?<![A-Z])([{positive}{negative}])\s*[:=]?\s*"
+            r"([+-]?\d+(?:\.\d+)?)",
+            r"([+-]?\d+(?:\.\d+)?)\s*°?\s*"
+            rf"([{positive}{negative}])(?![A-Z])",
+        )
+        for text in texts:
+            upper = text.upper().replace("−", "-").replace("–", "-")
+            for pattern in patterns:
+                for match in re.finditer(pattern, upper):
+                    first, second = match.groups()
+                    if first in {positive, negative}:
+                        direction, number_text = first, second
+                    else:
+                        number_text, direction = first, second
+                    try:
+                        visible_value = float(number_text)
+                    except ValueError:
+                        continue
+                    tolerance = max(1e-6, abs(value) * 1e-7)
+                    if abs(abs(visible_value) - abs(value)) <= tolerance:
+                        sign = -1.0 if direction == negative else 1.0
+                        return sign * abs(value)
+        return value
+
+    return directed(lat, "N", "S"), directed(lon, "E", "W")
+
+
 def recover_json(text: str) -> Optional[Dict[str, Any]]:
     """Recover the first JSON object from a model response."""
     candidate = text.strip()

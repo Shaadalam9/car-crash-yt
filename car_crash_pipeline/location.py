@@ -12,6 +12,7 @@ from urllib.request import Request, urlopen
 from . import settings
 from .shared import (
     clean_text,
+    coordinates_with_hemispheres,
     load_json,
     normalise_string_list,
     optional_text,
@@ -29,7 +30,8 @@ CONTINENT_CODES = {
     "South America": set("AR BO BR CL CO EC GY PY PE SR UY VE".split()),
     "Oceania": set("AU FJ KI MH FM NR NZ PW PG WS SB TO TV VU".split()),
 }
-LOCATION_RESOLUTION_VERSION = "segment_evidence_location_v3"
+LOCATION_RESOLUTION_VERSION = "segment_evidence_location_v4"
+NULL_PLACE_VALUES = {"none", "null", "unknown", "n/a", "na"}
 
 
 def _continent(iso2: Optional[str]) -> Optional[str]:
@@ -44,6 +46,40 @@ def _continent(iso2: Optional[str]) -> Optional[str]:
 def _iso3(iso2: Optional[str]) -> Optional[str]:
     if not iso2:
         return None
+    try:
+        import pycountry
+
+        country = pycountry.countries.get(alpha_2=iso2.upper())
+        return str(country.alpha_3) if country else None
+    except Exception:
+        return None
+
+
+def _looks_like_coordinate_text(value: Any) -> bool:
+    text = clean_text(value).upper().replace("−", "-").replace("–", "-")
+    if not text:
+        return False
+    number = r"[+-]?\d+(?:\.\d+)?"
+    north_south = re.search(
+        rf"(?:^|[^A-Z])(?:[NS]\s*[:=]?\s*{number}|{number}\s*°?\s*[NS])",
+        text,
+    )
+    east_west = re.search(
+        rf"(?:^|[^A-Z])(?:[EW]\s*[:=]?\s*{number}|{number}\s*°?\s*[EW])",
+        text,
+    )
+    return bool(north_south and east_west)
+
+
+def _place_text(value: Any) -> Optional[str]:
+    text = optional_text(value)
+    if (
+        text is None
+        or text.casefold() in NULL_PLACE_VALUES
+        or _looks_like_coordinate_text(text)
+    ):
+        return None
+    return text
 
 
 def _coordinate(value: Any, minimum: float, maximum: float) -> Optional[float]:
@@ -66,14 +102,16 @@ def _apply_nominatim_item(
     address = item.get("address", {}) if isinstance(item.get("address"), dict) else {}
     result["locality"] = next(
         (
-            optional_text(address.get(name))
+            _place_text(address.get(name))
             for name in ("city", "town", "village", "municipality", "borough")
-            if optional_text(address.get(name))
+            if _place_text(address.get(name))
         ),
-        locality,
+        _place_text(locality),
     )
-    result["state"] = optional_text(address.get("state")) or state_name
-    result["country"] = optional_text(address.get("country")) or country_name
+    result["state"] = _place_text(address.get("state")) or _place_text(state_name)
+    result["country"] = _place_text(address.get("country")) or _place_text(
+        country_name
+    )
     iso2 = optional_text(address.get("country_code"))
     subdivision = optional_text(
         address.get("ISO3166-2-lvl4") or address.get("ISO3166-2-lvl3")
@@ -101,19 +139,12 @@ def _apply_nominatim_item(
         if not result["locality"]
         or name.casefold() != str(result["locality"]).casefold()
     ]
-    try:
-        import pycountry
-
-        country = pycountry.countries.get(alpha_2=iso2.upper())
-        return str(country.alpha_3) if country else None
-    except Exception:
-        return None
 
 
 def geocode(fields: Dict[str, Any], cache: Dict[str, Any]) -> Dict[str, Any]:
-    locality = optional_text(fields.get("locality"))
-    state_name = optional_text(fields.get("state"))
-    country_name = optional_text(fields.get("country"))
+    locality = _place_text(fields.get("locality"))
+    state_name = _place_text(fields.get("state"))
+    country_name = _place_text(fields.get("country"))
     lat = _coordinate(fields.get("lat"), -90.0, 90.0)
     lon = _coordinate(fields.get("lon"), -180.0, 180.0)
     if (lat is None) != (lon is None):
@@ -139,7 +170,7 @@ def geocode(fields: Dict[str, Any], cache: Dict[str, Any]) -> Dict[str, Any]:
         return result
     if not settings.ENABLE_GEOCODING:
         return result
-    key = (
+    key = LOCATION_RESOLUTION_VERSION + ":" + (
         f"coordinates:{lat:.7f},{lon:.7f}"
         if reverse_lookup
         else str(query).casefold()
@@ -220,17 +251,21 @@ def _location_candidates(
             seen.add(key)
             candidates.append(cleaned)
 
-    def add_structured(source: Dict[str, Any]) -> None:
+    def add_structured(
+        source: Dict[str, Any], coordinate_evidence: Any = ()
+    ) -> None:
+        lat = _coordinate(source.get("lat"), -90.0, 90.0)
+        lon = _coordinate(source.get("lon"), -180.0, 180.0)
+        lat, lon = coordinates_with_hemispheres(
+            lat, lon, coordinate_evidence
+        )
         fields = {
-            name: source.get(name)
-            for name in (
-                "locality",
-                "locality_aka",
-                "state",
-                "country",
-                "lat",
-                "lon",
-            )
+            "locality": _place_text(source.get("locality")),
+            "locality_aka": source.get("locality_aka"),
+            "state": _place_text(source.get("state")),
+            "country": _place_text(source.get("country")),
+            "lat": lat,
+            "lon": lon,
         }
         has_place = any(
             fields.get(name) for name in ("locality", "state", "country")
@@ -244,20 +279,43 @@ def _location_candidates(
 
     def add_text(value: Any) -> None:
         text = clean_text(value)
-        if not text or len(text) > 180:
+        if (
+            not text
+            or len(text) > 180
+            or text.casefold() in NULL_PLACE_VALUES
+            or _looks_like_coordinate_text(text)
+        ):
             return
         lowered = text.casefold()
         if lowered.startswith("youtube title:") or lowered.startswith("youtube description:"):
             return
         add({"_location_query": text})
         for part in re.split(r"\s*[/|;]\s*", text):
-            if part and part != text:
+            if (
+                part
+                and part != text
+                and part.casefold() not in NULL_PLACE_VALUES
+                and not _looks_like_coordinate_text(part)
+            ):
                 add({"_location_query": part})
 
-    add_structured(segment)
+    review = segment.get("location_visual_review", {})
+    review_evidence = (
+        review.get("visible_location_text", [])
+        if isinstance(review, dict)
+        else []
+    )
+    coordinate_evidence = [
+        *normalise_string_list(segment.get("embedded_location_text")),
+        *normalise_string_list(review_evidence),
+    ]
+    add_structured(segment, coordinate_evidence)
+    existing_location = segment.get("location")
+    if isinstance(existing_location, dict):
+        add_structured(existing_location, coordinate_evidence)
     raw = recover_json(str(segment.get("raw_response") or ""))
     if isinstance(raw, dict):
-        add_structured(raw)
+        add_structured(raw, raw.get("embedded_location_text", []))
 
     for source in (segment, raw if isinstance(raw, dict) else {}):
         for text in normalise_string_list(source.get("embedded_location_text")):
@@ -316,9 +374,10 @@ def run_location_stage(state: Dict[str, Any]) -> int:
                     existing_location.get("location_resolution_version")
                     == LOCATION_RESOLUTION_VERSION
                 )
-                if status == "resolved" or (
-                    current_version
-                    and (not settings.ENABLE_GEOCODING or status != "not_attempted")
+                if current_version and (
+                    status == "resolved"
+                    or not settings.ENABLE_GEOCODING
+                    or status != "not_attempted"
                 ):
                     continue
 

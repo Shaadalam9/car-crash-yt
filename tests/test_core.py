@@ -2,6 +2,7 @@
 
 import csv
 import json
+import sys
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -25,6 +26,7 @@ from car_crash_pipeline.crash_review import (
     has_location_visual_review_errors,
     is_accepted_crash_review,
     invalid_location_visual_decision,
+    normalise_location_visual_decision,
     normalise_crash_decision,
     run_location_visual_stage,
     validate_location_visual_response,
@@ -36,7 +38,13 @@ from car_crash_pipeline.cut_detection import (
     build_full_segments,
     merge_nearby_times,
 )
-from car_crash_pipeline.location import geocode, _location_candidates, run_location_stage
+from car_crash_pipeline.location import (
+    LOCATION_RESOLUTION_VERSION,
+    _iso3,
+    _location_candidates,
+    geocode,
+    run_location_stage,
+)
 from car_crash_pipeline.output_writer import (
     MAPPING_COLUMNS,
     bracket_cell,
@@ -44,12 +52,35 @@ from car_crash_pipeline.output_writer import (
     iter_rows,
     write_output_csv,
 )
-from car_crash_pipeline.pipeline import cycle_pause_seconds, requires_processing
+from car_crash_pipeline.pipeline import (
+    cycle_pause_seconds,
+    discover_when_ready,
+    requires_processing,
+)
 from car_crash_pipeline.shared import replace_file_with_retry
 from car_crash_pipeline.youtube_discovery import YouTubeDiscovery
 
 
 class CorePipelineTests(unittest.TestCase):
+    def test_youtube_rate_limit_defers_discovery_without_crashing(self) -> None:
+        state = {"videos": {}, "discovery": {}}
+        with (
+            patch(
+                "car_crash_pipeline.pipeline.load_api_keys",
+                return_value=["test-key"],
+            ),
+            patch(
+                "car_crash_pipeline.pipeline.YouTubeDiscovery.discover",
+                side_effect=RuntimeError("HTTP Error 429: Too Many Requests"),
+            ),
+            patch("car_crash_pipeline.pipeline.save_state") as save,
+        ):
+            discovered = discover_when_ready(state)
+
+        self.assertEqual(discovered, 0)
+        self.assertIn("429", state["discovery"]["last_error"])
+        save.assert_called_once()
+
     def test_unfinished_location_work_uses_active_pause(self) -> None:
         with (
             patch(
@@ -788,6 +819,44 @@ class CorePipelineTests(unittest.TestCase):
 
         self.assertIsNone(error)
 
+    def test_location_response_applies_south_and_east_hemispheres(self) -> None:
+        data = {
+            "location_found": True,
+            "confidence": 0.98,
+            "locality": None,
+            "locality_aka": [],
+            "state": None,
+            "country": None,
+            "lat": 33.8187,
+            "lon": 150.9447,
+            "visible_location_text": ["S:33.8187 E:150.9447"],
+        }
+
+        self.assertIsNone(validate_location_visual_response(data))
+        decision = normalise_location_visual_decision(data, "{}")
+
+        self.assertEqual(decision.lat, -33.8187)
+        self.assertEqual(decision.lon, 150.9447)
+
+    def test_location_response_applies_compact_hemisphere_prefixes(self) -> None:
+        decision = normalise_location_visual_decision(
+            {
+                "location_found": True,
+                "confidence": 0.98,
+                "locality": "E144.7032,S37.8500",
+                "locality_aka": [],
+                "state": None,
+                "country": None,
+                "lat": 37.85,
+                "lon": 144.7032,
+                "visible_location_text": ["E144.7032,S37.8500"],
+            },
+            "{}",
+        )
+
+        self.assertEqual(decision.lat, -37.85)
+        self.assertEqual(decision.lon, 144.7032)
+
     def test_location_response_rejects_coordinates_not_in_visible_text(self) -> None:
         error = validate_location_visual_response(
             {
@@ -1039,7 +1108,23 @@ class CorePipelineTests(unittest.TestCase):
         self.assertEqual(result["state"], "OK")
         self.assertEqual(result["lat"], 36.1563122)
         self.assertEqual(result["lon"], -95.9927516)
+        self.assertEqual(result["iso3"], "USA")
+        self.assertEqual(result["continent"], "North America")
         self.assertEqual(result["geocode_status"], "resolved")
+
+    def test_iso3_conversion_uses_country_code(self) -> None:
+        alpha3 = {"AU": "AUS", "DE": "DEU"}
+        fake_pycountry = SimpleNamespace(
+            countries=SimpleNamespace(
+                get=lambda *, alpha_2: SimpleNamespace(
+                    alpha_3=alpha3[alpha_2]
+                )
+            )
+        )
+
+        with patch.dict(sys.modules, {"pycountry": fake_pycountry}):
+            self.assertEqual(_iso3("au"), "AUS")
+            self.assertEqual(_iso3("de"), "DEU")
 
     def test_location_review_rejects_unsupported_inference(self) -> None:
         error = validate_location_visual_response(
@@ -1128,6 +1213,73 @@ class CorePipelineTests(unittest.TestCase):
         self.assertIn(
             {"lat": 36.1563122, "lon": -95.9927516}, candidates
         )
+
+    def test_coordinate_text_is_not_used_as_a_locality(self) -> None:
+        segment = {
+            "locality": "S:33.8187 E:150.9447",
+            "lat": 33.8187,
+            "lon": 150.9447,
+            "embedded_location_text": ["S:33.8187 E:150.9447"],
+            "location_visual_review": {
+                "visible_location_text": ["S:33.8187 E:150.9447"]
+            },
+        }
+
+        candidates = _location_candidates(
+            {"segments": [segment, {}]}, segment
+        )
+
+        self.assertEqual(candidates[0], {"lat": -33.8187, "lon": 150.9447})
+        self.assertFalse(
+            any(
+                candidate.get("locality") == "S:33.8187 E:150.9447"
+                or candidate.get("_location_query")
+                == "S:33.8187 E:150.9447"
+                for candidate in candidates
+            )
+        )
+
+    def test_old_resolved_locations_are_reprocessed(self) -> None:
+        segment = {
+            "locality": "Melbourne",
+            "state": "Victoria",
+            "country": "Australia",
+            "location": {
+                "locality": "Melbourne",
+                "state": "Victoria",
+                "country": "Australia",
+                "iso3": None,
+                "continent": "Oceania",
+                "geocode_status": "resolved",
+                "location_resolution_version": "segment_evidence_location_v3",
+            },
+        }
+        state = {
+            "videos": {
+                "abc": {
+                    "status": "complete",
+                    "segments": [segment],
+                    "text_decision": {},
+                }
+            }
+        }
+        refreshed = {
+            **segment["location"],
+            "iso3": "AUS",
+            "location_resolution_version": LOCATION_RESOLUTION_VERSION,
+        }
+
+        with (
+            patch("car_crash_pipeline.location.load_json", return_value={}),
+            patch("car_crash_pipeline.location.geocode", return_value=refreshed) as lookup,
+            patch("car_crash_pipeline.location.write_json_atomic"),
+            patch("car_crash_pipeline.location.save_state"),
+        ):
+            processed = run_location_stage(state)
+
+        self.assertEqual(processed, 1)
+        lookup.assert_called()
+        self.assertEqual(segment["location"]["iso3"], "AUS")
 
 
 if __name__ == "__main__":

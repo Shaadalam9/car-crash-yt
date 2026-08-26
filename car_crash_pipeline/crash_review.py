@@ -18,6 +18,7 @@ from .model_loading import load_model_with_fallback
 from .shared import (
     clamp_float,
     clean_text,
+    coordinates_with_hemispheres,
     log,
     normalise_bool,
     normalise_string_list,
@@ -176,6 +177,12 @@ def normalise_location_visual_decision(
             ),
             raw_response=raw_response,
         )
+    evidence = normalise_string_list(data.get("visible_location_text"))
+    lat, lon = coordinates_with_hemispheres(
+        _normalise_coordinate(data.get("lat"), -90.0, 90.0),
+        _normalise_coordinate(data.get("lon"), -180.0, 180.0),
+        evidence,
+    )
     return LocationVisualDecision(
         location_found=True,
         confidence=clamp_float(data.get("confidence")),
@@ -183,11 +190,9 @@ def normalise_location_visual_decision(
         locality_aka=normalise_string_list(data.get("locality_aka")),
         state=optional_text(data.get("state")),
         country=optional_text(data.get("country")),
-        lat=_normalise_coordinate(data.get("lat"), -90.0, 90.0),
-        lon=_normalise_coordinate(data.get("lon"), -180.0, 180.0),
-        visible_location_text=normalise_string_list(
-            data.get("visible_location_text")
-        ),
+        lat=lat,
+        lon=lon,
+        visible_location_text=evidence,
         raw_response=raw_response,
     )
 
@@ -681,8 +686,10 @@ visible.
 
 If a latitude and longitude pair is visibly written in the clip, transcribe it
 as decimal numbers in lat and lon and also preserve the exact coordinate text
-in visible_location_text. Do not estimate coordinates from the scene. Both
-coordinates must be clearly readable; otherwise set both to null.
+in visible_location_text. Convert south and west coordinates to negative
+numbers; north and east coordinates are positive. Do not estimate coordinates
+from the scene. Both coordinates must be clearly readable; otherwise set both
+to null.
 
 The confidence value is certainty that the location reading is correct. If no
 explicit geographic text is clearly readable, or if any letters or digits are
