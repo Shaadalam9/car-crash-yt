@@ -20,6 +20,8 @@ www.youtube.com_cookies.txt
 .DS_Storecookies.txt
 /cookies.txt
 cookies.txt
+nightly_sync.log
+sync_processed_files.zsh
 
 # Big files
 state.json
