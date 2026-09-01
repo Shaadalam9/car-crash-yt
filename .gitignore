@@ -20,3 +20,7 @@ www.youtube.com_cookies.txt
 .DS_Storecookies.txt
 /cookies.txt
 cookies.txt
+
+# Big files
+state.json
+geocode_cache.json
