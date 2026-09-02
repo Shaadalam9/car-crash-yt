@@ -11,6 +11,7 @@ secret
 config
 .env
 *.env
+.venv
 
 # Data files
 data
@@ -26,3 +27,5 @@ sync_processed_files.zsh
 # Big files
 state.json
 geocode_cache.json
+
+_output

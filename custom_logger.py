@@ -1,4 +1,6 @@
 import logging
+logging.getLogger("kaleido").setLevel(logging.WARNING)
+logging.getLogger("choreographer").setLevel(logging.WARNING)
 
 
 class CustomLogger:
