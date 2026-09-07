@@ -133,7 +133,7 @@ class CorePipelineTests(unittest.TestCase):
         self.assertTrue(review["retry_exhausted"])
         self.assertIsNone(review["error"])
         self.assertEqual(review["terminal_error"], "json_recovery_failed")
-        self.assertIn("Skipped 1", warning)
+        self.assertIn("Skipped 1", warning)  # pyright: ignore[reportArgumentType]
         self.assertFalse(has_visual_review_errors(record))
 
     def test_persistent_location_error_becomes_unknown_terminal_review(self) -> None:
