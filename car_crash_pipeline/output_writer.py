@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Tuple
 
 from . import settings
+from .location import LOCATION_RESOLUTION_VERSION
 from .shared import replace_file_with_retry
 
 
@@ -351,6 +352,12 @@ def _resolved_location(value: Any) -> Dict[str, Any]:
         return {}
 
     if str(value.get("geocode_status") or "").strip() != "resolved":
+        return {}
+
+    # Never publish legacy geographic resolutions through the new schema.
+    # A v4 row is allowed back into CSV output only after the v7 resolver has
+    # revalidated it as the canonical locality entity.
+    if value.get("location_resolution_version") != LOCATION_RESOLUTION_VERSION:
         return {}
 
     if not _clean_locality(value.get("locality"), value):

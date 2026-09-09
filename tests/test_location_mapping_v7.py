@@ -3,7 +3,11 @@
 import unittest
 from unittest.mock import patch
 
-from car_crash_pipeline.location import geocode
+from car_crash_pipeline.location import (
+    LOCATION_RESOLUTION_VERSION,
+    geocode,
+    run_location_stage,
+)
 from car_crash_pipeline.output_writer import iter_mapping_rows
 
 
@@ -204,6 +208,7 @@ class LocationMappingRegressionTests(unittest.TestCase):
                                 "osm_id": 444,
                                 "place_id": 4,
                                 "geocode_status": "resolved",
+                                "location_resolution_version": LOCATION_RESOLUTION_VERSION,
                             },
                         }
                     ],
@@ -236,6 +241,97 @@ class LocationMappingRegressionTests(unittest.TestCase):
         self.assertEqual(rows[0]["locality"], "Kita")
         self.assertEqual(rows[0]["state"], "")
         self.assertEqual(rows[0]["videos"], "[resolved]")
+
+    def test_mapping_excludes_legacy_resolved_location_until_v7(self) -> None:
+        state = {
+            "videos": {
+                "legacy": {
+                    "status": "complete",
+                    "segments": [
+                        {
+                            "start_time": 1.0,
+                            "end_time": 2.0,
+                            "time_of_day": "day",
+                            "road_users": ["car"],
+                            "location": {
+                                "locality": "DANBURN",
+                                "state": "unknown",
+                                "country": "unknown",
+                                "lat": None,
+                                "lon": None,
+                                "geocode_status": "resolved",
+                                "location_resolution_version": (
+                                    "segment_evidence_location_v4"
+                                ),
+                            },
+                        }
+                    ],
+                }
+            }
+        }
+
+        self.assertEqual(list(iter_mapping_rows(state)), [])
+
+    def test_location_migration_can_be_bounded_and_checkpointed(self) -> None:
+        state = {
+            "videos": {
+                "video": {
+                    "status": "complete",
+                    "segments": [
+                        {
+                            "locality": f"City {index}",
+                            "location": {
+                                "locality": f"City {index}",
+                                "country": "Country",
+                                "geocode_status": "resolved",
+                                "location_resolution_version": (
+                                    "segment_evidence_location_v4"
+                                ),
+                            },
+                        }
+                        for index in range(3)
+                    ],
+                }
+            }
+        }
+
+        def resolved(fields, _cache):
+            return {
+                "locality": fields.get("locality"),
+                "locality_aka": [],
+                "state": None,
+                "country": "Country",
+                "iso3": "TST",
+                "continent": "Test",
+                "lat": 1.0,
+                "lon": 2.0,
+                "osm_type": "relation",
+                "osm_id": 100,
+                "place_id": 200,
+                "geocode_status": "resolved",
+                "location_resolution_version": LOCATION_RESOLUTION_VERSION,
+            }
+
+        with (
+            patch(
+                "car_crash_pipeline.location.geocode",
+                side_effect=resolved,
+            ),
+            patch("car_crash_pipeline.location.load_json", return_value={}),
+            patch("car_crash_pipeline.location.write_json_atomic") as cache_save,
+            patch("car_crash_pipeline.location.save_state") as state_save,
+        ):
+            processed = run_location_stage(state, max_segments=2)
+
+        self.assertEqual(processed, 2)
+        self.assertEqual(cache_save.call_count, 1)
+        self.assertEqual(state_save.call_count, 1)
+        versions = [
+            segment["location"].get("location_resolution_version")
+            for segment in state["videos"]["video"]["segments"]
+        ]
+        self.assertEqual(versions[:2], [LOCATION_RESOLUTION_VERSION] * 2)
+        self.assertEqual(versions[2], "segment_evidence_location_v4")
 
 
 if __name__ == "__main__":

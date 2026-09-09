@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import math
 import tempfile
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -38,6 +39,23 @@ from .shared import (
 CRASH_TAXONOMY_VERSION = "nhtsa_mmucc6_video_v1"
 CRASH_TAXONOMY_STANDARD = "NHTSA MMUCC 6th Edition (2024)"
 TAXONOMY_REVIEW_ATTEMPTS = 2
+TAXONOMY_DOWNLOAD_RETRY_SECONDS = 900
+
+# Only errors that clearly indicate the source itself is unavailable are
+# terminal. Network, DNS, timeout, rate limit, authentication and other
+# operational failures remain retryable.
+_TERMINAL_VIDEO_DOWNLOAD_MARKERS = (
+    "video unavailable",
+    "this video is unavailable",
+    "private video",
+    "this video is private",
+    "video has been removed",
+    "has been removed by the uploader",
+    "has been removed for violating",
+    "this video is no longer available",
+    "account associated with this video has been terminated",
+)
+
 
 EVENT_KINDS = {
     "collision",
@@ -453,6 +471,34 @@ def _mark_video_unavailable(
     record["crash_taxonomy_status"] = "video_unavailable"
     record["crash_taxonomy_error"] = error
     record["crash_taxonomy_version"] = CRASH_TAXONOMY_VERSION
+    record.pop("crash_taxonomy_download_retry_after", None)
+
+
+def _is_terminal_video_download_error(error: str) -> bool:
+    """Return True only for errors that clearly describe an unavailable source."""
+    normalised = clean_text(error).casefold()
+    return any(
+        marker in normalised
+        for marker in _TERMINAL_VIDEO_DOWNLOAD_MARKERS
+    )
+
+
+def _mark_retryable_video_download_error(
+    record: Dict[str, Any],
+    error: str,
+) -> None:
+    """
+    Preserve taxonomy as pending after an operational download failure.
+
+    A short cooldown prevents the same video from monopolising a pipeline that
+    intentionally processes only one historical taxonomy video per cycle.
+    """
+    record["crash_taxonomy_status"] = "download_error"
+    record["crash_taxonomy_error"] = error
+    record.pop("crash_taxonomy_version", None)
+    record["crash_taxonomy_download_retry_after"] = (
+        time.time() + TAXONOMY_DOWNLOAD_RETRY_SECONDS
+    )
 
 
 def _existing_video_path(video_id: str, record: Dict[str, Any]) -> Optional[Path]:
@@ -601,6 +647,11 @@ def _cleanup_taxonomy_video_if_safe(
     if not settings.DELETE_VIDEO_AFTER_PROCESSING:
         return
 
+    # A retryable taxonomy result still needs this exact source on a later
+    # cycle. Retaining it avoids an unnecessary YouTube re-download.
+    if crash_taxonomy_pending(record):
+        return
+
     from .crash_review import (
         _needs_location_visual_review,
         has_location_visual_review_errors,
@@ -621,19 +672,50 @@ def _cleanup_taxonomy_video_if_safe(
     log(f"Deleted taxonomy-reviewed video: {video_path}")
 
 
-def run_crash_taxonomy_stage(state: Dict[str, Any]) -> int:
+def run_crash_taxonomy_stage(
+    state: Dict[str, Any],
+    max_videos: Optional[int] = None,
+) -> int:
     """
     Backfill MMUCC taxonomy for completed accepted segments.
 
-    Old state is upgraded on restart. If an old YouTube source can no longer be
-    downloaded, its accepted segment remains intact and is terminally marked
-    ``video_unavailable`` so the continuous queue is never blocked.
+    Old state is upgraded on restart. Clearly unavailable YouTube sources are
+    terminally marked ``video_unavailable``. Operational download failures
+    remain pending with a cooldown so another historical video can progress.
     """
-    pending_records = [
+    all_pending_records = [
         (video_id, record)
         for video_id, record in state.get("videos", {}).items()
         if crash_taxonomy_pending(record)
-    ][: settings.MAX_VIDEOS_PER_RUN]
+    ]
+
+    if max_videos is None:
+        video_limit = settings.MAX_VIDEOS_PER_RUN
+    else:
+        try:
+            video_limit = max(1, int(max_videos))
+        except (TypeError, ValueError):
+            raise ValueError("max_videos must be a positive integer")
+
+    # Skip videos that are cooling down after a transient download failure.
+    # This is important when max_videos=1: the next historical video can still
+    # progress instead of the first failing video starving the whole queue.
+    now = time.time()
+    pending_records = []
+    for video_id, record in all_pending_records:
+        try:
+            retry_after = float(
+                record.get("crash_taxonomy_download_retry_after", 0.0) or 0.0
+            )
+        except (TypeError, ValueError):
+            retry_after = 0.0
+
+        if retry_after > now:
+            continue
+
+        pending_records.append((video_id, record))
+        if len(pending_records) >= video_limit:
+            break
 
     if not pending_records:
         return 0
@@ -654,14 +736,29 @@ def run_crash_taxonomy_stage(state: Dict[str, Any]) -> int:
                 raise
             except Exception as exc:
                 error = clean_text(exc) or "video_download_failed"
-                _mark_video_unavailable(record, segments, error)
+
+                if _is_terminal_video_download_error(error):
+                    _mark_video_unavailable(record, segments, error)
+                    log(
+                        f"Skipping taxonomy backfill for unavailable video "
+                        f"{video_id}: {error}"
+                    )
+                    processed += len(segments)
+                else:
+                    _mark_retryable_video_download_error(record, error)
+                    log(
+                        f"Deferring taxonomy backfill after retryable video "
+                        f"download failure for {video_id}: {error}"
+                    )
+
                 save_state(settings.STATE_JSON, state)
-                log(
-                    f"Skipping taxonomy backfill for unavailable video "
-                    f"{video_id}: {error}"
-                )
-                processed += len(segments)
                 continue
+
+            # A successful reuse or download clears any previous cooldown.
+            record.pop("crash_taxonomy_download_retry_after", None)
+            if record.get("crash_taxonomy_status") == "download_error":
+                record["crash_taxonomy_status"] = None
+                record["crash_taxonomy_error"] = None
 
             if judge is None:
                 from .crash_review import CosmosCrashJudge
@@ -747,6 +844,34 @@ def run_crash_taxonomy_stage(state: Dict[str, Any]) -> int:
                 record["crash_taxonomy_status"] = "classified"
                 record["crash_taxonomy_error"] = None
                 record["crash_taxonomy_version"] = CRASH_TAXONOMY_VERSION
+
+            # The source is already available and Cosmos is already loaded.
+            # Reuse both to fill any missing high-resolution visual location
+            # evidence before deciding whether the source can be deleted.
+            try:
+                from .crash_review import review_missing_segment_locations
+
+                location_reviewed = review_missing_segment_locations(
+                    video_id,
+                    record,
+                    judge,
+                    video_path,
+                )
+                if location_reviewed:
+                    log(
+                        f"Location visual backfill for {video_id}: "
+                        f"{location_reviewed} segment(s)"
+                    )
+            except KeyboardInterrupt:
+                save_state(settings.STATE_JSON, state)
+                raise
+            except Exception as exc:
+                # Location recovery is useful but must not roll back a valid
+                # taxonomy classification. The retained source can be retried
+                # by the normal location visual stage when appropriate.
+                log(
+                    f"Location visual backfill failed for {video_id}: {exc}"
+                )
 
             save_state(settings.STATE_JSON, state)
             _cleanup_taxonomy_video_if_safe(record, video_path)

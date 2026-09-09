@@ -975,81 +975,115 @@ def _is_retryable_status(status: str) -> bool:
     return status == "not_attempted" or status.startswith("failed:")
 
 
-def run_location_stage(state: Dict[str, Any]) -> int:
+def run_location_stage(
+    state: Dict[str, Any],
+    max_segments: Optional[int] = None,
+) -> int:
+    """Resolve a bounded number of stale/retryable segment locations.
+
+    ``max_segments`` is deliberately optional so direct callers and existing
+    tests retain the historical "process everything" behaviour. The
+    continuous pipeline supplies a small limit, which makes large v4 -> v7
+    migrations resumable and prevents geocoding from starving GPU taxonomy
+    work for hours before the first checkpoint.
+    """
     cache = load_json(settings.GEOCODE_CACHE, {})
     if not isinstance(cache, dict):
         cache = {}
 
+    limit: Optional[int]
+    if max_segments is None:
+        limit = None
+    else:
+        try:
+            limit = max(1, int(max_segments))
+        except (TypeError, ValueError):
+            raise ValueError("max_segments must be a positive integer")
+
     processed = 0
 
-    for record in state.get("videos", {}).values():
-        if not isinstance(record, dict) or record.get("status") != "complete":
-            continue
-
-        for segment in record.get("segments", []):
-            if not isinstance(segment, dict):
+    try:
+        for record in state.get("videos", {}).values():
+            if not isinstance(record, dict) or record.get("status") != "complete":
                 continue
 
-            existing_location = segment.get("location")
-            if isinstance(existing_location, dict):
-                status = clean_text(existing_location.get("geocode_status"))
-                current_version = (
-                    existing_location.get("location_resolution_version")
-                    == LOCATION_RESOLUTION_VERSION
-                )
+            for segment in record.get("segments", []):
+                if not isinstance(segment, dict):
+                    continue
 
-                if current_version:
-                    if status in TERMINAL_LOCATION_STATUSES:
-                        continue
-                    if not settings.ENABLE_GEOCODING:
-                        continue
+                existing_location = segment.get("location")
+                if isinstance(existing_location, dict):
+                    status = clean_text(existing_location.get("geocode_status"))
+                    current_version = (
+                        existing_location.get("location_resolution_version")
+                        == LOCATION_RESOLUTION_VERSION
+                    )
 
-            candidates = _location_candidates(record, segment)
+                    if current_version:
+                        if status in TERMINAL_LOCATION_STATUSES:
+                            continue
+                        if not settings.ENABLE_GEOCODING:
+                            continue
 
-            if not candidates:
-                segment["location"] = _unknown_location(
-                    "not_attempted"
-                    if not settings.ENABLE_GEOCODING
-                    else "no_evidence"
-                )
-                processed += 1
-                continue
+                candidates = _location_candidates(record, segment)
 
-            resolved = _unknown_location(
-                "not_attempted"
-                if not settings.ENABLE_GEOCODING
-                else "not_found"
-            )
-
-            if not settings.ENABLE_GEOCODING:
-                resolved = geocode(candidates[0], cache)
-            else:
-                first_retryable: Optional[Dict[str, Any]] = None
-                first_terminal: Optional[Dict[str, Any]] = None
-
-                for fields in candidates:
-                    candidate = geocode(fields, cache)
-                    status = clean_text(candidate.get("geocode_status"))
-
-                    if status == "resolved":
-                        resolved = candidate
-                        break
-
-                    if _is_retryable_status(status):
-                        if first_retryable is None:
-                            first_retryable = candidate
-                    elif first_terminal is None:
-                        first_terminal = candidate
+                if not candidates:
+                    segment["location"] = _unknown_location(
+                        "not_attempted"
+                        if not settings.ENABLE_GEOCODING
+                        else "no_evidence"
+                    )
+                    processed += 1
                 else:
-                    if first_retryable is not None:
-                        resolved = first_retryable
-                    elif first_terminal is not None:
-                        resolved = first_terminal
+                    resolved = _unknown_location(
+                        "not_attempted"
+                        if not settings.ENABLE_GEOCODING
+                        else "not_found"
+                    )
 
-            segment["location"] = resolved
-            processed += 1
+                    if not settings.ENABLE_GEOCODING:
+                        resolved = geocode(candidates[0], cache)
+                    else:
+                        first_retryable: Optional[Dict[str, Any]] = None
+                        first_terminal: Optional[Dict[str, Any]] = None
+
+                        for fields in candidates:
+                            candidate = geocode(fields, cache)
+                            status = clean_text(candidate.get("geocode_status"))
+
+                            if status == "resolved":
+                                resolved = candidate
+                                break
+
+                            if _is_retryable_status(status):
+                                if first_retryable is None:
+                                    first_retryable = candidate
+                            elif first_terminal is None:
+                                first_terminal = candidate
+                        else:
+                            if first_retryable is not None:
+                                resolved = first_retryable
+                            elif first_terminal is not None:
+                                resolved = first_terminal
+
+                    segment["location"] = resolved
+                    processed += 1
+
+                if limit is not None and processed >= limit:
+                    break
+
+            if limit is not None and processed >= limit:
+                break
+    except KeyboardInterrupt:
+        if processed:
+            write_json_atomic(settings.GEOCODE_CACHE, cache)
+            save_state(settings.STATE_JSON, state)
+        raise
 
     if processed:
+        # One atomic checkpoint per bounded batch. With the production pipeline
+        # limit this caps the amount of geocoding work that can be lost on a
+        # pod restart without repeatedly rewriting a ~hundreds-of-MB state file.
         write_json_atomic(settings.GEOCODE_CACHE, cache)
         save_state(settings.STATE_JSON, state)
 

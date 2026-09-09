@@ -17,7 +17,7 @@ from car_crash_pipeline.output_writer import iter_mapping_rows, iter_rows
 
 
 class CrashTaxonomyTests(unittest.TestCase):
-    def test_motor_vehicle_collision_uses_mmucc_c6_and_c9(self) -> None:
+    def test_motor_vehicle_collision_uses_mmucc_c7_and_c9(self) -> None:
         data = {
             "event_kind": "collision",
             "manner_of_collision": "front_to_rear_or_rear_to_front",
@@ -161,6 +161,97 @@ class CrashTaxonomyTests(unittest.TestCase):
             crash_taxonomy_pending(state["videos"]["missingVideo"])
         )
 
+    def test_transient_download_failure_remains_pending(self) -> None:
+        state = {
+            "videos": {
+                "temporaryFailure": {
+                    "status": "complete",
+                    "segments": [
+                        {
+                            "segment_index": 0,
+                            "start_time": 1.0,
+                            "end_time": 2.0,
+                            "duration_seconds": 1.0,
+                        }
+                    ],
+                }
+            }
+        }
+
+        with (
+            patch(
+                "car_crash_pipeline.crash_taxonomy._obtain_video",
+                side_effect=RuntimeError("HTTP Error 429: Too Many Requests"),
+            ),
+            patch("car_crash_pipeline.crash_taxonomy.save_state"),
+            patch(
+                "car_crash_pipeline.crash_taxonomy.time.time",
+                return_value=1000.0,
+            ),
+        ):
+            processed = run_crash_taxonomy_stage(state, max_videos=1)
+
+        record = state["videos"]["temporaryFailure"]
+        segment = record["segments"][0]
+
+        self.assertEqual(processed, 0)
+        self.assertEqual(record["crash_taxonomy_status"], "download_error")
+        self.assertEqual(
+            record["crash_taxonomy_download_retry_after"],
+            1900.0,
+        )
+        self.assertNotIn("crash_taxonomy_version", segment)
+        self.assertTrue(crash_taxonomy_pending(record))
+
+    def test_download_cooldown_does_not_starve_next_video(self) -> None:
+        state = {
+            "videos": {
+                "coolingDown": {
+                    "status": "complete",
+                    "crash_taxonomy_status": "download_error",
+                    "crash_taxonomy_download_retry_after": 1900.0,
+                    "segments": [
+                        {
+                            "segment_index": 0,
+                            "start_time": 1.0,
+                            "end_time": 2.0,
+                            "duration_seconds": 1.0,
+                        }
+                    ],
+                },
+                "nextVideo": {
+                    "status": "complete",
+                    "segments": [
+                        {
+                            "segment_index": 0,
+                            "start_time": 1.0,
+                            "end_time": 2.0,
+                            "duration_seconds": 1.0,
+                        }
+                    ],
+                },
+            }
+        }
+
+        with (
+            patch(
+                "car_crash_pipeline.crash_taxonomy._obtain_video",
+                side_effect=RuntimeError("Video unavailable"),
+            ) as obtain_video,
+            patch("car_crash_pipeline.crash_taxonomy.save_state"),
+            patch(
+                "car_crash_pipeline.crash_taxonomy.time.time",
+                return_value=1000.0,
+            ),
+        ):
+            processed = run_crash_taxonomy_stage(state, max_videos=1)
+
+        self.assertEqual(processed, 1)
+        obtain_video.assert_called_once()
+        self.assertEqual(obtain_video.call_args.args[0], "nextVideo")
+        self.assertTrue(crash_taxonomy_pending(state["videos"]["coolingDown"]))
+        self.assertFalse(crash_taxonomy_pending(state["videos"]["nextVideo"]))
+
     def test_csv_outputs_include_taxonomy(self) -> None:
         state = {
             "videos": {
@@ -215,6 +306,7 @@ class CrashTaxonomyTests(unittest.TestCase):
                                 "osm_id": 123,
                                 "place_id": 456,
                                 "geocode_status": "resolved",
+                                "location_resolution_version": "segment_evidence_location_v7",
                             },
                         }
                     ],
@@ -247,6 +339,55 @@ class CrashTaxonomyTests(unittest.TestCase):
         self.assertEqual(
             mapping_row["crash_taxonomy_status"],
             "[classified]",
+        )
+
+    def test_taxonomy_backfill_can_be_limited_to_one_video(self) -> None:
+        state = {
+            "videos": {
+                "first": {
+                    "status": "complete",
+                    "segments": [
+                        {
+                            "segment_index": 0,
+                            "start_time": 1.0,
+                            "end_time": 2.0,
+                            "duration_seconds": 1.0,
+                        }
+                    ],
+                },
+                "second": {
+                    "status": "complete",
+                    "segments": [
+                        {
+                            "segment_index": 0,
+                            "start_time": 3.0,
+                            "end_time": 4.0,
+                            "duration_seconds": 1.0,
+                        }
+                    ],
+                },
+            }
+        }
+
+        with (
+            patch(
+                "car_crash_pipeline.crash_taxonomy._obtain_video",
+                side_effect=RuntimeError("Video unavailable"),
+            ),
+            patch("car_crash_pipeline.crash_taxonomy.save_state"),
+        ):
+            processed = run_crash_taxonomy_stage(state, max_videos=1)
+
+        self.assertEqual(processed, 1)
+        self.assertEqual(
+            state["videos"]["first"]["segments"][0][
+                "crash_taxonomy_version"
+            ],
+            CRASH_TAXONOMY_VERSION,
+        )
+        self.assertNotIn(
+            "crash_taxonomy_version",
+            state["videos"]["second"]["segments"][0],
         )
 
 

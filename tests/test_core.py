@@ -336,6 +336,23 @@ class CorePipelineTests(unittest.TestCase):
                             "end_time": 20.5,
                             "time_of_day": "day",
                             "road_users": ["car", "truck"],
+                            "event_kind": "collision",
+                            "manner_of_collision_code":
+                                "C9_FRONT_TO_REAR_OR_REAR_TO_FRONT",
+                            "manner_of_collision":
+                                "front_to_rear_or_rear_to_front",
+                            "first_harmful_event_code":
+                                "C7_MOTOR_VEHICLE_IN_TRANSPORT",
+                            "first_harmful_event":
+                                "motor_vehicle_in_transport",
+                            "sequence_of_events": [
+                                "motor_vehicle_in_transport"
+                            ],
+                            "crash_taxonomy_standard":
+                                "NHTSA MMUCC 6th Edition (2024)",
+                            "crash_taxonomy_status": "classified",
+                            "crash_taxonomy_version":
+                                "nhtsa_mmucc6_video_v1",
                             "location": {
                                 "locality": "Toronto",
                                 "state": "Ontario",
@@ -344,6 +361,9 @@ class CorePipelineTests(unittest.TestCase):
                                 "continent": "North America",
                                 "lat": 43.6534817,
                                 "lon": -79.3839347,
+                                "geocode_status": "resolved",
+                                "location_resolution_version":
+                                    "segment_evidence_location_v7",
                             },
                         }
                     ],
@@ -368,8 +388,18 @@ class CorePipelineTests(unittest.TestCase):
                 "start_time",
                 "end_time",
                 "vehicle_type",
+                "event_kind",
+                "manner_of_collision_code",
+                "manner_of_collision",
+                "first_harmful_event_code",
+                "first_harmful_event",
+                "sequence_of_events",
+                "crash_taxonomy_standard",
+                "crash_taxonomy_status",
+                "crash_taxonomy_version",
             ],
         )
+
         row = next(iter(iter_mapping_rows(state)))
         self.assertEqual(row["id"], 1)
         self.assertEqual(row["locality"], "Toronto")
@@ -378,6 +408,19 @@ class CorePipelineTests(unittest.TestCase):
         self.assertEqual(row["time_of_day"], "[day]")
         self.assertEqual(row["start_time"], "[8.25]")
         self.assertEqual(row["end_time"], "[20.5]")
+        self.assertEqual(row["event_kind"], "[collision]")
+        self.assertEqual(
+            row["manner_of_collision"],
+            "[front_to_rear_or_rear_to_front]",
+        )
+        self.assertEqual(
+            row["first_harmful_event"],
+            "[motor_vehicle_in_transport]",
+        )
+        self.assertEqual(
+            row["sequence_of_events"],
+            "[[motor_vehicle_in_transport]]",
+        )
 
     def test_mapping_groups_alexandria_without_combining_segment_ranges(self) -> None:
         alexandria = {
@@ -388,6 +431,8 @@ class CorePipelineTests(unittest.TestCase):
             "continent": "North America",
             "lat": 38.8408718,
             "lon": -77.1144703,
+            "geocode_status": "resolved",
+            "location_resolution_version": "segment_evidence_location_v7",
         }
         state = {
             "videos": {
@@ -431,6 +476,8 @@ class CorePipelineTests(unittest.TestCase):
             "continent": "North America",
             "lat": 33.6060031,
             "lon": -78.9730887,
+            "geocode_status": "resolved",
+            "location_resolution_version": "segment_evidence_location_v7",
         }
         state = {
             "videos": {
@@ -466,7 +513,7 @@ class CorePipelineTests(unittest.TestCase):
         self.assertEqual(rows[0]["end_time"], "[1077.833,1082.833]")
         self.assertEqual(rows[0]["vehicle_type"], "[car,car]")
 
-    def test_mapping_collapses_unknown_places_into_one_row(self) -> None:
+    def test_mapping_excludes_unknown_places(self) -> None:
         state = {
             "videos": {
                 "abc": {
@@ -505,19 +552,16 @@ class CorePipelineTests(unittest.TestCase):
 
         rows = list(iter_mapping_rows(state))
 
-        self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0]["locality"], "unknown")
-        self.assertEqual(rows[0]["videos"], "[abc,def]")
-        self.assertEqual(rows[0]["time_of_day"], "[[day,night],[unknown]]")
-        self.assertEqual(rows[0]["start_time"], "[[0.0,20.0],[4.0]]")
-        self.assertEqual(rows[0]["end_time"], "[[5.0,30.0],[9.0]]")
-        self.assertEqual(rows[0]["vehicle_type"], "[car,truck,car]")
+        # Unresolved geography remains auditable in state.json and the
+        # segment-level output, but mapping.csv contains only v7-resolved
+        # canonical localities.
+        self.assertEqual(rows, [])
 
     def test_mapping_bracket_cells_do_not_quote_list_items(self) -> None:
         self.assertEqual(bracket_cell(["jJXT2zGlSc0"]), "[jJXT2zGlSc0]")
         self.assertEqual(bracket_cell(["car", "truck"]), "[car,truck]")
 
-    def test_mapping_csv_is_written_with_one_row_per_locality(self) -> None:
+    def test_mapping_csv_omits_unresolved_segments(self) -> None:
         state = {
             "videos": {
                 "abc": {
@@ -535,24 +579,33 @@ class CorePipelineTests(unittest.TestCase):
                 }
             }
         }
+
         with TemporaryDirectory() as temporary:
             output = Path(temporary) / "crash_segments.csv"
             mapping = Path(temporary) / "mapping.csv"
+
             with (
-                patch("car_crash_pipeline.output_writer.settings.OUTPUT_CSV", output),
-                patch("car_crash_pipeline.output_writer.settings.MAPPING_CSV", mapping),
+                patch(
+                    "car_crash_pipeline.output_writer.settings.OUTPUT_CSV",
+                    output,
+                ),
+                patch(
+                    "car_crash_pipeline.output_writer.settings.MAPPING_CSV",
+                    mapping,
+                ),
             ):
                 write_output_csv(state)
 
-            with mapping.open("r", encoding="utf-8", newline="") as handle:
+            with mapping.open(
+                "r",
+                encoding="utf-8",
+                newline="",
+            ) as handle:
                 reader = csv.DictReader(handle)
                 rows = list(reader)
 
         self.assertEqual(reader.fieldnames, MAPPING_COLUMNS)
-        self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0]["id"], "1")
-        self.assertEqual(rows[0]["locality"], "unknown")
-        self.assertEqual(rows[0]["videos"], "[abc]")
+        self.assertEqual(rows, [])
 
     def test_author_timestamp_labels_follow_full_segments(self) -> None:
         labels = extract_description_timestamps(
@@ -1069,48 +1122,117 @@ class CorePipelineTests(unittest.TestCase):
             judge.assert_not_called()
 
     def test_visible_coordinates_are_reverse_geocoded(self) -> None:
-        payload = {
-            "lat": "36.1563000",
-            "lon": "-95.9927000",
+        reverse_payload = {
+            "place_id": 100,
+            "osm_type": "way",
+            "osm_id": 200,
+            "class": "highway",
+            "type": "residential",
+            "addresstype": "road",
+            "name": "Example Road",
+            "lat": "36.1563122",
+            "lon": "-95.9927516",
             "address": {
+                "road": "Example Road",
                 "city": "Resolved City",
-                "state": "Resolved Region",
-                "country": "Resolved Country",
+                "state": "Oklahoma",
+                "country": "United States",
                 "country_code": "us",
-                "ISO3166-2-lvl4": "US-OK",
             },
-            "namedetails": {},
         }
 
+        canonical_payload = [
+            {
+                "place_id": 300,
+                "osm_type": "relation",
+                "osm_id": 400,
+                "class": "place",
+                "type": "city",
+                "addresstype": "city",
+                "name": "Resolved City",
+                "lat": "36.1539800",
+                "lon": "-95.9927750",
+                "address": {
+                    "city": "Resolved City",
+                    "state": "Oklahoma",
+                    "country": "United States",
+                    "country_code": "us",
+                    "ISO3166-2-lvl4": "US-OK",
+                },
+                "namedetails": {
+                    "name:en": "Resolved City",
+                },
+            }
+        ]
+
         class Response:
+            def __init__(self, payload):
+                self.payload = payload
+
             def __enter__(self):
                 return self
 
-            def __exit__(self, *args):
+            def __exit__(self, exc_type, exc, tb):
                 return False
 
             def read(self):
-                return json.dumps(payload).encode("utf-8")
+                return json.dumps(self.payload).encode("utf-8")
+
+        def fake_urlopen(request, timeout=30):
+            url = request.full_url
+            if "/reverse?" in url:
+                return Response(reverse_payload)
+            if "/search?" in url:
+                return Response(canonical_payload)
+            raise AssertionError(f"Unexpected Nominatim URL: {url}")
 
         with (
-            patch("car_crash_pipeline.location.settings.ENABLE_GEOCODING", True),
-            patch("car_crash_pipeline.location.settings.GEOCODER_DELAY_SECONDS", 0),
-            patch("car_crash_pipeline.location.urlopen", return_value=Response()) as open_url,
-            patch("car_crash_pipeline.location._iso3", return_value="USA"),
+            patch(
+                "car_crash_pipeline.location.settings.ENABLE_GEOCODING",
+                True,
+            ),
+            patch(
+                "car_crash_pipeline.location.settings.GEOCODER_DELAY_SECONDS",
+                0,
+            ),
+            patch(
+                "car_crash_pipeline.location.urlopen",
+                side_effect=fake_urlopen,
+            ) as open_url,
+            patch(
+                "car_crash_pipeline.location._iso3",
+                return_value="USA",
+            ),
         ):
             result = geocode(
                 {"lat": 36.1563122, "lon": -95.9927516},
                 {},
             )
 
-        self.assertIn("/reverse?", open_url.call_args.args[0].full_url)
+        self.assertEqual(open_url.call_count, 2)
+        self.assertIn(
+            "/reverse?",
+            open_url.call_args_list[0].args[0].full_url,
+        )
+        self.assertIn(
+            "/search?",
+            open_url.call_args_list[1].args[0].full_url,
+        )
+
         self.assertEqual(result["locality"], "Resolved City")
         self.assertEqual(result["state"], "OK")
-        self.assertEqual(result["lat"], 36.1563122)
-        self.assertEqual(result["lon"], -95.9927516)
+        self.assertEqual(result["country"], "United States")
+        self.assertEqual(result["lat"], 36.15398)
+        self.assertEqual(result["lon"], -95.992775)
+        self.assertEqual(result["candidate_lat"], 36.1563122)
+        self.assertEqual(result["candidate_lon"], -95.9927516)
         self.assertEqual(result["iso3"], "USA")
         self.assertEqual(result["continent"], "North America")
         self.assertEqual(result["geocode_status"], "resolved")
+        self.assertEqual(
+            result["location_resolution_version"],
+            "segment_evidence_location_v7",
+        )
 
     def test_iso3_conversion_uses_country_code(self) -> None:
         alpha3 = {"AU": "AUS", "DE": "DEU"}

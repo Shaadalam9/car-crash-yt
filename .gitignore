@@ -5,6 +5,7 @@ build/
 dist/
 wheels/
 *.egg-info
+.DS_Store
 
 # Secrets and local configuration
 secret
@@ -23,6 +24,7 @@ www.youtube.com_cookies.txt
 cookies.txt
 nightly_sync.log
 sync_processed_files.zsh
+.mapping.csv.download
 
 # Big files
 state.json
