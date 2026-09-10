@@ -13,6 +13,7 @@ config
 .env
 *.env
 .venv
+refresh_spike_analysis.sh
 
 # Data files
 data
