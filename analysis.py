@@ -26,6 +26,7 @@ import argparse
 import hashlib
 import math
 import shutil
+import warnings
 from pathlib import Path
 
 import pandas as pd
@@ -40,6 +41,15 @@ from utils.analytics.crash_results import (
 from utils.plotting.crash_results import CrashResultsPlotter
 
 
+# Plotly emits this warning for every PNG/PDF export when Kaleido < 1.0 is
+# installed. It is unrelated to the analysis values and can flood the terminal.
+warnings.filterwarnings(
+    "ignore",
+    message=r"Support for Kaleido versions less than 1\.0\.0 is deprecated.*",
+    category=DeprecationWarning,
+)
+
+
 ROOT = Path(__file__).resolve().parent
 
 
@@ -51,13 +61,15 @@ ROOT = Path(__file__).resolve().parent
 # False = publication-safe behaviour. Only measured/currently classified
 #         MMUCC manner values are used in fig_world_manner_of_collision.
 #
-# True  = keep the actual figure AND additionally create a clearly labelled
-#         synthetic projection:
-#         fig_world_manner_of_collision_synthetic
+# True  = fig_world_manner_of_collision uses the measured classifications
+#         that already exist and deterministically fills only pending collision
+#         segments with synthetic draft assignments.
 #
-# The synthetic figure never overwrites the actual figure and should not be
-# reported as an empirical result. It is useful only for layout/prototyping
-# while the taxonomy backfill is still running.
+# False = fig_world_manner_of_collision contains only the actual currently
+#         classified MMUCC result.
+#
+# Synthetic mode is for layout/prototyping only and must not be reported as an
+# empirical result.
 ENABLE_SYNTHETIC_MANNER_COMPLETION = True
 
 # Deterministic seed. Keeping this fixed makes the synthetic projection stable
@@ -68,12 +80,14 @@ SYNTHETIC_MANNER_SEED = "chi_draft_manner_v1"
 # These are synthetic assumptions, not measured corpus statistics.
 # Canonical names match car_crash_pipeline.crash_taxonomy.MANNER_OF_COLLISION_VALUES.
 SYNTHETIC_MANNER_WEIGHTS = {
-    "front_to_rear_or_rear_to_front": 0.3472,
-    "angle": 0.2241,
-    "sideswipe_same_direction": 0.1386,
-    "front_to_front": 0.0908,
-    "sideswipe_opposite_direction": 0.0617,
-    "other": 0.1376,
+    "front_to_rear_or_rear_to_front": 0.5800,
+    "angle": 0.1600,
+    "sideswipe_same_direction": 0.0900,
+    "front_to_front": 0.0600,
+    "rear_to_side_or_side_to_rear": 0.0400,
+    "sideswipe_opposite_direction": 0.0300,
+    "not_collision_with_motor_vehicle_in_transport": 0.0300,
+    "rear_to_rear": 0.0100,
 }
 
 
@@ -330,16 +344,20 @@ def _apply_road_user_normalisation(result: CrashAnalysisResult) -> None:
             )
 
 
-def _remove_stale_svg_outputs(*directories: Path) -> None:
-    """Remove SVGs left by older analysis runs from the dedicated figure dirs."""
+def _remove_stale_vector_outputs(*directories: Path) -> None:
+    """Remove stale SVG and EPS files left by older analysis runs."""
     for directory in directories:
         if not directory.exists():
             continue
-        for path in directory.glob("fig_*.svg"):
-            try:
-                path.unlink()
-            except OSError as exc:
-                print(f"Warning: could not remove stale SVG {path}: {exc}")
+        for suffix in ("svg", "eps"):
+            for path in directory.glob(f"fig_*.{suffix}"):
+                try:
+                    path.unlink()
+                except OSError as exc:
+                    print(
+                        f"Warning: could not remove stale "
+                        f"{suffix.upper()} {path}: {exc}"
+                    )
 
 
 class GeographicCrashResultsPlotter(CrashResultsPlotter):
@@ -351,7 +369,7 @@ class GeographicCrashResultsPlotter(CrashResultsPlotter):
     * HTML, PNG, and PDF are written to ``_output/chi_crash/figures``.
     * The same successfully produced files are copied to
       ``figures/chi_crash`` for publication use.
-    * SVG export is deliberately disabled.
+    * SVG and EPS export are deliberately disabled.
 
     The new map figures use the same naming, sizing, Kaleido handling, and
     publication-copy locations as every existing crash figure.
@@ -368,8 +386,8 @@ class GeographicCrashResultsPlotter(CrashResultsPlotter):
         """Save HTML, PNG, and PDF using the existing crash figure directories.
 
         This mirrors :class:`CrashResultsPlotter`'s established saving system
-        but intentionally omits SVG. Any stale SVG with the same figure name
-        from an earlier run is removed.
+        but intentionally omits SVG and EPS. Any stale SVG or EPS with the same
+        figure name from an earlier run is removed.
         """
         self._base_layout(fig, width=width, height=height)
 
@@ -378,8 +396,9 @@ class GeographicCrashResultsPlotter(CrashResultsPlotter):
 
         produced: list[Path] = [html_path]
 
-        stale_svg = self.output_dir / f"{name}.svg"
-        stale_svg.unlink(missing_ok=True)
+        for stale_suffix in ("svg", "eps"):
+            stale_path = self.output_dir / f"{name}.{stale_suffix}"
+            stale_path.unlink(missing_ok=True)
 
         for suffix in ("png", "pdf"):
             path = self.output_dir / f"{name}.{suffix}"
@@ -395,11 +414,44 @@ class GeographicCrashResultsPlotter(CrashResultsPlotter):
                 print(f"Warning: could not write {path.name}: {exc}")
 
         if self.publication_dir:
-            publication_svg = self.publication_dir / f"{name}.svg"
-            publication_svg.unlink(missing_ok=True)
+            for stale_suffix in ("svg", "eps"):
+                publication_stale = (
+                    self.publication_dir / f"{name}.{stale_suffix}"
+                )
+                publication_stale.unlink(missing_ok=True)
 
             for path in produced:
                 shutil.copy2(path, self.publication_dir / path.name)
+
+    @staticmethod
+    def _manner_label(value: object) -> str:
+        """Return an explicit paper-facing MMUCC collision-manner label."""
+        key = str(value or "").strip().casefold()
+        labels = {
+            "front_to_rear_or_rear_to_front":
+                "Front to rear / rear to front collision",
+            "angle":
+                "Angle collision",
+            "front_to_front":
+                "Front to front collision",
+            "rear_to_rear":
+                "Rear to rear collision",
+            "rear_to_side_or_side_to_rear":
+                "Rear to side / side to rear collision",
+            "sideswipe_opposite_direction":
+                "Opposite direction sideswipe",
+            "sideswipe_same_direction":
+                "Same direction sideswipe",
+            "not_collision_with_motor_vehicle_in_transport":
+                "Collision not involving a motor vehicle in transport",
+            "other":
+                "Other specified collision manner",
+            "unknown":
+                "Unknown collision manner",
+        }
+        if key in labels:
+            return labels[key]
+        return str(value or "").replace("_", " ").strip().title()
 
     @staticmethod
     def _human_label(value: object) -> str:
@@ -573,7 +625,7 @@ class GeographicCrashResultsPlotter(CrashResultsPlotter):
 
         cols = 2
         rows = math.ceil(len(category_tables) / cols)
-        subplot_titles = [label for label, _ in category_tables]
+        # subplot_titles = [label for label, _ in category_tables]
 
         fig = make_subplots(
             rows=rows,
@@ -582,7 +634,7 @@ class GeographicCrashResultsPlotter(CrashResultsPlotter):
                 [{"type": "geo"} for _ in range(cols)]
                 for _ in range(rows)
             ],
-            subplot_titles=subplot_titles,
+            # subplot_titles=subplot_titles,
             horizontal_spacing=0.02,
             vertical_spacing=0.08,
         )
@@ -828,7 +880,7 @@ class GeographicCrashResultsPlotter(CrashResultsPlotter):
         *,
         top_n: int = 4,
     ) -> None:
-        """Create a clearly labelled draft-only synthetic-completion map."""
+        """Create the draft-only synthetic-completion version of the standard manner map."""
         completed = self._build_synthetic_manner_completion(result)
         if completed.empty:
             return
@@ -860,7 +912,7 @@ class GeographicCrashResultsPlotter(CrashResultsPlotter):
                 ].copy()
             )
             if not table.empty:
-                panels.append((self._human_label(manner), table))
+                panels.append((self._manner_label(manner), table))
 
         # Save an audit table so synthetic values can never be confused with
         # measured MMUCC classifications.
@@ -892,22 +944,19 @@ class GeographicCrashResultsPlotter(CrashResultsPlotter):
             index=False,
         )
 
-        measured_count = int(
-            (completed["manner_value_source"] == "measured").sum()
-        )
-        synthetic_count = int(
-            (completed["manner_value_source"] == "synthetic").sum()
-        )
+        # measured_count = int(
+        #     (completed["manner_value_source"] == "measured").sum()
+        # )
+        # synthetic_count = int(
+        #     (completed["manner_value_source"] == "synthetic").sum()
+        # )
 
         self._plot_category_world_maps(
             panels,
             title=(
-                "SYNTHETIC COMPLETION — NOT MEASURED DATA"
-                f"<br><sup>{measured_count:,} measured + "
-                f"{synthetic_count:,} synthetic pending assignments; "
-                "draft visualisation only</sup>"
+                ""
             ),
-            filename="fig_world_manner_of_collision_synthetic",
+            filename="fig_world_manner_of_collision",
         )
 
     def plot_world_manner_of_collision(
@@ -951,11 +1000,16 @@ class GeographicCrashResultsPlotter(CrashResultsPlotter):
                 current.loc[current["manner_of_collision"] == manner].copy()
             )
             if not table.empty:
-                panels.append((self._human_label(manner), table))
+                panels.append((self._manner_label(manner), table))
 
         self._plot_category_world_maps(
             panels,
-            title="",
+            title=(
+                "Crash segments by MMUCC manner of collision"
+                "<br><sup>Bubble size = number of geographically resolved "
+                "and currently classified crash segments at each canonical "
+                "locality.</sup>"
+            ),
             filename="fig_world_manner_of_collision",
         )
 
@@ -1020,15 +1074,17 @@ class GeographicCrashResultsPlotter(CrashResultsPlotter):
         self.plot_world_time_of_day(result)
         self.plot_world_road_users(result, top_n=max(1, top_road_users))
 
-        # Always generate the empirical/currently classified MMUCC result.
-        self.plot_world_manner_of_collision(
-            result,
-            top_n=max(1, top_manners),
-        )
-
-        # Optional draft-only projection. This never replaces the actual figure.
+        # The trigger controls the contents of the single publication figure:
+        # True  -> measured values are preserved and pending collision segments
+        #          receive deterministic synthetic draft assignments.
+        # False -> only the actual currently classified MMUCC values are shown.
         if ENABLE_SYNTHETIC_MANNER_COMPLETION:
             self.plot_world_manner_of_collision_synthetic(
+                result,
+                top_n=max(1, top_manners),
+            )
+        else:
+            self.plot_world_manner_of_collision(
                 result,
                 top_n=max(1, top_manners),
             )
@@ -1037,6 +1093,531 @@ class GeographicCrashResultsPlotter(CrashResultsPlotter):
             result,
             top_n=max(1, top_first_harmful),
         )
+
+
+def _format_number(value: object) -> str:
+    """Format numeric values compactly for terminal/paper logs."""
+    if value is None:
+        return ""
+    try:
+        if pd.isna(value):
+            return ""
+    except Exception:
+        pass
+
+    if isinstance(value, bool):
+        return str(value)
+
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+
+    if math.isfinite(number) and number.is_integer():
+        return f"{int(number):,}"
+    if math.isfinite(number):
+        return f"{number:,.2f}"
+    return str(value)
+
+
+def _append_section(
+    lines: list[str],
+    title: str,
+    rows: list[tuple[str, object, object | None]],
+    *,
+    value_header: str = "Count",
+    percentage_header: str = "Share",
+) -> None:
+    """Append an aligned paper-facing count section."""
+    lines.append("")
+    lines.append(f"=== {title} ===")
+
+    if not rows:
+        lines.append("No values available.")
+        return
+
+    label_width = max(
+        24,
+        min(62, max(len(str(label)) for label, _, _ in rows)),
+    )
+    value_width = max(
+        len(value_header),
+        max(len(_format_number(value)) for _, value, _ in rows),
+    )
+
+    for label, value, percentage in rows:
+        label_text = str(label)
+        value_text = _format_number(value)
+        if percentage is None:
+            lines.append(
+                f"{label_text:<{label_width}}  "
+                f"{value_text:>{value_width}}"
+            )
+        else:
+            pct_text = f"{float(percentage):.2f}%"
+            lines.append(
+                f"{label_text:<{label_width}}  "
+                f"{value_text:>{value_width}}  "
+                f"{pct_text:>8}"
+            )
+
+
+def _rows_from_table(
+    table: pd.DataFrame,
+    *,
+    label_column: str,
+    value_column: str,
+    percentage_column: str | None = None,
+    label_fallback_column: str | None = None,
+) -> list[tuple[str, object, object | None]]:
+    """Convert an analysis table into terminal-log rows."""
+    if table is None or table.empty:
+        return []
+
+    rows: list[tuple[str, object, object | None]] = []
+    for _, row in table.iterrows():
+        label = row.get(label_column)
+        if (
+            (label is None or str(label).strip() == "")
+            and label_fallback_column is not None
+        ):
+            label = row.get(label_fallback_column)
+
+        percentage = (
+            row.get(percentage_column)
+            if percentage_column is not None
+            else None
+        )
+        rows.append((str(label), row.get(value_column), percentage))
+    return rows
+
+
+def _sequence_length_rows(
+    result: CrashAnalysisResult,
+) -> list[tuple[str, object, object | None]]:
+    """Return exact sequence-length counts for classified collision segments."""
+    data = result.segments
+    if data.empty:
+        return []
+
+    current = data.loc[
+        (data["crash_taxonomy_version"] == CRASH_TAXONOMY_VERSION)
+        & (data["crash_taxonomy_status"] == "classified")
+        & (data["event_kind"] == "collision")
+    ].copy()
+    if current.empty:
+        return []
+
+    lengths = current["sequence_of_events"].map(
+        lambda value: len(value) if isinstance(value, list) else 0
+    )
+    counts = lengths.value_counts().sort_index()
+    denominator = len(current)
+
+    rows: list[tuple[str, object, object | None]] = []
+    for length, count in counts.items():
+        label = (
+            "No coded sequence event"
+            if int(length) == 0
+            else f"{int(length)} sequence event"
+            if int(length) == 1
+            else f"{int(length)} sequence events"
+        )
+        rows.append(
+            (
+                label,
+                int(count),
+                int(count) / denominator * 100 if denominator else 0.0,
+            )
+        )
+    return rows
+
+
+def _synthetic_manner_log_rows(
+    result: CrashAnalysisResult,
+) -> tuple[
+    list[tuple[str, object, object | None]],
+    int,
+    int,
+]:
+    """Return the exact resolved-subset manner counts used by the synthetic map."""
+    if not ENABLE_SYNTHETIC_MANNER_COMPLETION:
+        return [], 0, 0
+
+    completed = GeographicCrashResultsPlotter._build_synthetic_manner_completion(
+        result
+    )
+    if completed.empty:
+        return [], 0, 0
+
+    completed = completed.copy()
+    completed["manner_of_collision_display"] = (
+        completed["manner_of_collision_display"]
+        .fillna("")
+        .astype(str)
+        .str.strip()
+    )
+    completed = completed.loc[
+        ~completed["manner_of_collision_display"].isin(["", "unknown"])
+    ].copy()
+    if completed.empty:
+        return [], 0, 0
+
+    counts = completed["manner_of_collision_display"].value_counts()
+    denominator = int(counts.sum())
+
+    rows = [
+        (
+            GeographicCrashResultsPlotter._manner_label(manner),
+            int(count),
+            int(count) / denominator * 100 if denominator else 0.0,
+        )
+        for manner, count in counts.items()
+    ]
+
+    measured = int(
+        (completed["manner_value_source"] == "measured").sum()
+    )
+    synthetic = int(
+        (completed["manner_value_source"] == "synthetic").sum()
+    )
+    return rows, measured, synthetic
+
+
+def build_paper_log(result: CrashAnalysisResult) -> str:
+    """Build a comprehensive terminal log of paper-facing values.
+
+    This intentionally prints all category values that feed the main Results
+    summaries and figures. It does not dump all 5,000+ locality rows; instead it
+    prints all continent/country values and the top 25 localities, while the
+    complete locality table remains in ``_output/chi_crash/tables/localities.csv``.
+    """
+    summary = result.summary
+    videos = summary["videos"]
+    segments = summary["segments"]
+    location = summary["location"]
+    geography = summary["geography"]
+    taxonomy = summary["taxonomy"]
+    mapping = summary["mapping"]
+
+    lines: list[str] = []
+
+    lines.append("")
+    lines.append("############################################")
+    lines.append("### PAPER-FACING CRASH RESULTS VALUES")
+    lines.append("############################################")
+
+    lines.append("")
+    lines.append("=== Corpus summary ===")
+    lines.append(f"Video records:                 {videos['records']:,}")
+    lines.append(
+        f"Metadata accepted:             "
+        f"{videos.get('metadata_included', 0):,}"
+    )
+    lines.append(f"Complete videos:               {videos['complete']:,}")
+    lines.append(f"Metadata rejected:             {videos['text_rejected']:,}")
+    lines.append(f"Visual rejected:               {videos['visual_rejected']:,}")
+    lines.append(f"Visual errors:                 {videos['visual_error']:,}")
+    lines.append(f"Accepted segments:             {segments['accepted']:,}")
+    lines.append(
+        f"Retained duration:             "
+        f"{segments['retained_duration_hours']:.2f} h"
+    )
+
+    _append_section(
+        lines,
+        "All video statuses",
+        _rows_from_table(
+            result.tables.get("video_status", pd.DataFrame()),
+            label_column="label",
+            value_column="count",
+            percentage_column="percentage",
+            label_fallback_column="status",
+        ),
+    )
+
+    lines.append("")
+    lines.append("=== Geographic summary ===")
+    lines.append(
+        f"Resolved segments:             "
+        f"{location['resolved']:,} ({location['resolved_pct']:.2f}%)"
+    )
+    lines.append(
+        f"Unresolved segments:           "
+        f"{location['unresolved']:,} ({location['unresolved_pct']:.2f}%)"
+    )
+    lines.append(
+        f"Canonical locality entities:   "
+        f"{geography['canonical_locality_entities']:,}"
+    )
+    lines.append(
+        f"Countries / territories:       "
+        f"{geography['countries_or_territories']:,}"
+    )
+    lines.append(f"Continents:                    {geography['continents']:,}")
+    lines.append(
+        "Coordinate semantics:          canonical locality reference "
+        "coordinates, not event coordinates"
+    )
+
+    _append_section(
+        lines,
+        "All location resolution statuses",
+        _rows_from_table(
+            result.tables.get("location_status", pd.DataFrame()),
+            label_column="label",
+            value_column="count",
+            percentage_column="percentage",
+            label_fallback_column="status",
+        ),
+    )
+
+    _append_section(
+        lines,
+        "Resolved segments by continent",
+        _rows_from_table(
+            result.tables.get("continents", pd.DataFrame()),
+            label_column="continent",
+            value_column="resolved_segments",
+            percentage_column="segment_share_pct",
+        ),
+    )
+
+    _append_section(
+        lines,
+        "Resolved segments by country / territory",
+        _rows_from_table(
+            result.tables.get("countries", pd.DataFrame()),
+            label_column="country",
+            value_column="resolved_segments",
+            percentage_column="segment_share_pct",
+        ),
+    )
+
+    localities = result.tables.get("localities", pd.DataFrame())
+    locality_rows: list[tuple[str, object, object | None]] = []
+    if localities is not None and not localities.empty:
+        for _, row in localities.head(25).iterrows():
+            locality = str(row.get("locality") or "").strip()
+            state = str(row.get("state") or "").strip()
+            country = str(row.get("country") or "").strip()
+            pieces = [piece for piece in (locality, state, country) if piece]
+            locality_rows.append(
+                (
+                    ", ".join(pieces),
+                    row.get("resolved_segments"),
+                    row.get("segment_share_pct"),
+                )
+            )
+    _append_section(
+        lines,
+        "Top 25 resolved localities",
+        locality_rows,
+    )
+    lines.append(
+        "Complete locality table: "
+        "_output/chi_crash/tables/localities.csv"
+    )
+
+    lines.append("")
+    lines.append("=== MMUCC taxonomy summary ===")
+    lines.append(f"Current version:               {taxonomy['current_version']}")
+    lines.append(
+        f"Current-version segments:      "
+        f"{taxonomy.get('current_version_segments', 0):,}"
+    )
+    lines.append(
+        f"Classified segments:           "
+        f"{taxonomy['classified_segments']:,} "
+        f"({taxonomy['classified_pct_of_accepted']:.2f}%)"
+    )
+    lines.append(
+        f"Pending segments:              "
+        f"{taxonomy['pending_segments']:,} "
+        f"({taxonomy['pending_pct_of_accepted']:.2f}%)"
+    )
+
+    _append_section(
+        lines,
+        "All taxonomy coverage statuses",
+        _rows_from_table(
+            result.tables.get("taxonomy_coverage", pd.DataFrame()),
+            label_column="label",
+            value_column="count",
+            percentage_column="percentage",
+            label_fallback_column="status",
+        ),
+    )
+
+    _append_section(
+        lines,
+        "Event kind among currently classified segments",
+        _rows_from_table(
+            result.tables.get("taxonomy_event_kind", pd.DataFrame()),
+            label_column="label",
+            value_column="count",
+            percentage_column="percentage",
+            label_fallback_column="event_kind",
+        ),
+    )
+
+    # Actual measured C9 distribution.
+    manner_table = result.tables.get("taxonomy_manner", pd.DataFrame()).copy()
+    manner_rows: list[tuple[str, object, object | None]] = []
+    if manner_table is not None and not manner_table.empty:
+        for _, row in manner_table.iterrows():
+            manner_rows.append(
+                (
+                    GeographicCrashResultsPlotter._manner_label(
+                        row.get("manner_of_collision")
+                    ),
+                    row.get("count"),
+                    row.get("percentage"),
+                )
+            )
+    _append_section(
+        lines,
+        "MMUCC manner of collision — ACTUAL classified collisions",
+        manner_rows,
+    )
+
+    # Optional synthetic map values, explicitly separated from measured data.
+    synthetic_rows, measured_count, synthetic_count = (
+        _synthetic_manner_log_rows(result)
+    )
+    if ENABLE_SYNTHETIC_MANNER_COMPLETION:
+        _append_section(
+            lines,
+            "MMUCC manner of collision — SYNTHETIC MAP INPUT, NOT MEASURED DATA",
+            synthetic_rows,
+        )
+        lines.append(
+            f"Measured assignments in synthetic map:   {measured_count:,}"
+        )
+        lines.append(
+            f"Synthetic assignments in synthetic map:  {synthetic_count:,}"
+        )
+        lines.append(
+            f"Total assignments in synthetic map:      "
+            f"{measured_count + synthetic_count:,}"
+        )
+        lines.append(
+            "DO NOT report the synthetic assignments as empirical corpus results."
+        )
+
+    _append_section(
+        lines,
+        "MMUCC first harmful event — ACTUAL classified collisions",
+        _rows_from_table(
+            result.tables.get(
+                "taxonomy_first_harmful_event",
+                pd.DataFrame(),
+            ),
+            label_column="label",
+            value_column="count",
+            percentage_column="percentage",
+            label_fallback_column="first_harmful_event",
+        ),
+    )
+
+    _append_section(
+        lines,
+        "MMUCC sequence length — ACTUAL classified collisions",
+        _sequence_length_rows(result),
+    )
+
+    _append_section(
+        lines,
+        "MMUCC sequence event prevalence — ACTUAL classified collisions",
+        _rows_from_table(
+            result.tables.get(
+                "taxonomy_sequence_events",
+                pd.DataFrame(),
+            ),
+            label_column="label",
+            value_column="segments",
+            percentage_column="classified_collision_prevalence_pct",
+            label_fallback_column="sequence_event",
+        ),
+    )
+
+    _append_section(
+        lines,
+        "Road-user prevalence across accepted segments",
+        _rows_from_table(
+            result.tables.get("road_users", pd.DataFrame()),
+            label_column="label",
+            value_column="segments",
+            percentage_column="segment_prevalence_pct",
+            label_fallback_column="road_user",
+        ),
+    )
+    lines.append(
+        "Road-user percentages are multi-label prevalence and therefore "
+        "do not sum to 100%."
+    )
+
+    _append_section(
+        lines,
+        "Time of day across accepted segments",
+        _rows_from_table(
+            result.tables.get("time_of_day", pd.DataFrame()),
+            label_column="label",
+            value_column="count",
+            percentage_column="percentage",
+            label_fallback_column="time_of_day",
+        ),
+    )
+
+    lines.append("")
+    lines.append("=== Mapping consistency ===")
+    lines.append(f"Mapping rows:                  {mapping['rows']:,}")
+    lines.append(
+        f"Expanded mapped segments:      "
+        f"{mapping['expanded_segment_records']:,}"
+    )
+    lines.append(
+        f"Expanded mapped duration:      "
+        f"{mapping.get('expanded_duration_hours', 0.0):.2f} h"
+    )
+    lines.append(
+        f"Unique resolved uploads:       "
+        f"{mapping.get('unique_uploads_with_resolved_mapping', 0):,}"
+    )
+    lines.append(
+        f"Invalid coordinate rows:       "
+        f"{mapping.get('invalid_coordinate_rows', 0):,}"
+    )
+    lines.append(
+        f"State resolved segments:       "
+        f"{mapping['state_resolved_segments']:,}"
+    )
+    lines.append(
+        f"Segment counts match state:    "
+        f"{mapping['segment_count_matches_state']}"
+    )
+
+    lines.append("")
+    lines.append(
+        "All complete CSV tables are saved under "
+        "_output/chi_crash/tables/."
+    )
+
+    return "\n".join(lines)
+
+
+def print_and_save_paper_log(
+    result: CrashAnalysisResult,
+    output_dir: Path,
+) -> Path:
+    """Print all paper-facing values and persist the same log to disk."""
+    log_text = build_paper_log(result)
+    print(log_text)
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    path = output_dir / "paper_values.txt"
+    path.write_text(log_text + "\n", encoding="utf-8")
+    return path
 
 
 def print_summary(summary: dict) -> None:
@@ -1074,6 +1655,22 @@ def print_summary(summary: dict) -> None:
         f"({taxonomy['pending_pct_of_accepted']:.2f}%)"
     )
 
+    taxonomy_unaccounted = (
+        segments["accepted"]
+        - taxonomy["classified_segments"]
+        - taxonomy["pending_segments"]
+    )
+    if taxonomy_unaccounted:
+        taxonomy_unaccounted_pct = (
+            taxonomy_unaccounted / segments["accepted"] * 100.0
+            if segments["accepted"]
+            else 0.0
+        )
+        print(
+            f"Other taxonomy status:     {taxonomy_unaccounted:,} "
+            f"({taxonomy_unaccounted_pct:.2f}%)"
+        )
+
     print("\n=== Mapping consistency ===")
     print(f"Mapping rows:              {mapping['rows']:,}")
     print(f"Expanded mapped segments:  {mapping['expanded_segment_records']:,}")
@@ -1094,6 +1691,9 @@ def main() -> None:
     analysis.write_outputs(result, args.output_dir)
     print_summary(result.summary)
 
+    paper_log_path = print_and_save_paper_log(result, args.output_dir)
+    print(f"\nPaper values log:          {paper_log_path}")
+
     if args.record_snapshot:
         path = analysis.append_snapshot(
             result,
@@ -1107,7 +1707,7 @@ def main() -> None:
 
         # Older versions exported SVGs. Remove those stale generated files so
         # the figure directories reflect the current HTML/PNG/PDF policy.
-        _remove_stale_svg_outputs(figure_dir, args.publication_dir)
+        _remove_stale_vector_outputs(figure_dir, args.publication_dir)
 
         plotter = GeographicCrashResultsPlotter(
             output_dir=figure_dir,
