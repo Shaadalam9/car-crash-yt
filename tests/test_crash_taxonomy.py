@@ -161,7 +161,7 @@ class CrashTaxonomyTests(unittest.TestCase):
             crash_taxonomy_pending(state["videos"]["missingVideo"])
         )
 
-    def test_transient_download_failure_remains_pending(self) -> None:
+    def test_any_download_failure_is_skipped_immediately(self) -> None:
         state = {
             "videos": {
                 "temporaryFailure": {
@@ -184,32 +184,25 @@ class CrashTaxonomyTests(unittest.TestCase):
                 side_effect=RuntimeError("HTTP Error 429: Too Many Requests"),
             ),
             patch("car_crash_pipeline.crash_taxonomy.save_state"),
-            patch(
-                "car_crash_pipeline.crash_taxonomy.time.time",
-                return_value=1000.0,
-            ),
         ):
             processed = run_crash_taxonomy_stage(state, max_videos=1)
 
         record = state["videos"]["temporaryFailure"]
         segment = record["segments"][0]
 
-        self.assertEqual(processed, 0)
-        self.assertEqual(record["crash_taxonomy_status"], "download_error")
-        self.assertEqual(
-            record["crash_taxonomy_download_retry_after"],
-            1900.0,
-        )
-        self.assertNotIn("crash_taxonomy_version", segment)
-        self.assertTrue(crash_taxonomy_pending(record))
+        self.assertEqual(processed, 1)
+        self.assertEqual(record["crash_taxonomy_status"], "download_failed")
+        self.assertEqual(segment["crash_taxonomy_status"], "download_failed")
+        self.assertEqual(segment["crash_taxonomy_version"], CRASH_TAXONOMY_VERSION)
+        self.assertFalse(crash_taxonomy_pending(record))
 
-    def test_download_cooldown_does_not_starve_next_video(self) -> None:
+    def test_legacy_cooldown_record_is_retried_once_then_skipped(self) -> None:
         state = {
             "videos": {
                 "coolingDown": {
                     "status": "complete",
                     "crash_taxonomy_status": "download_error",
-                    "crash_taxonomy_download_retry_after": 1900.0,
+                    "crash_taxonomy_download_retry_after": 9e18,
                     "segments": [
                         {
                             "segment_index": 0,
@@ -236,20 +229,22 @@ class CrashTaxonomyTests(unittest.TestCase):
         with (
             patch(
                 "car_crash_pipeline.crash_taxonomy._obtain_video",
-                side_effect=RuntimeError("Video unavailable"),
+                side_effect=RuntimeError("Sorry, this content is age-restricted"),
             ) as obtain_video,
             patch("car_crash_pipeline.crash_taxonomy.save_state"),
-            patch(
-                "car_crash_pipeline.crash_taxonomy.time.time",
-                return_value=1000.0,
-            ),
         ):
-            processed = run_crash_taxonomy_stage(state, max_videos=1)
+            first = run_crash_taxonomy_stage(state, max_videos=1)
+            second = run_crash_taxonomy_stage(state, max_videos=1)
 
-        self.assertEqual(processed, 1)
-        obtain_video.assert_called_once()
-        self.assertEqual(obtain_video.call_args.args[0], "nextVideo")
-        self.assertTrue(crash_taxonomy_pending(state["videos"]["coolingDown"]))
+        self.assertEqual((first, second), (1, 1))
+        self.assertEqual(
+            [call.args[0] for call in obtain_video.call_args_list],
+            ["coolingDown", "nextVideo"],
+        )
+        cooling = state["videos"]["coolingDown"]
+        self.assertEqual(cooling["crash_taxonomy_status"], "age_restricted")
+        self.assertNotIn("crash_taxonomy_download_retry_after", cooling)
+        self.assertFalse(crash_taxonomy_pending(cooling))
         self.assertFalse(crash_taxonomy_pending(state["videos"]["nextVideo"]))
 
     def test_csv_outputs_include_taxonomy(self) -> None:

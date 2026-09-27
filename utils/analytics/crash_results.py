@@ -112,7 +112,7 @@ def _normalise_geocode_status(location: Any) -> str:
     status = _clean_text(location.get("geocode_status"))
     if not status:
         return "missing_location_status"
-    if status.startswith("failed:"):
+    if status.startswith("failed"):
         return "failed"
     return status
 

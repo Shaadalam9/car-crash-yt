@@ -17,6 +17,7 @@ from .cut_detection import FullSegment, build_full_segments, detect_candidate_cu
 from .model_loading import load_model_with_fallback
 from .shared import (
     clamp_float,
+    classify_download_failure,
     clean_text,
     coordinates_with_hemispheres,
     log,
@@ -51,6 +52,15 @@ CRASH_TYPES = {
     "unknown",
 }
 LOCATION_EVIDENCE_VALUES = {"metadata", "embedded_text", "both", "none"}
+# Terminal statuses for videos that are skipped instead of retried forever:
+# the download failed (private, removed, age-restricted, ...) or processing
+# kept failing for MAX_REVIEW_CYCLES cycles.
+DOWNLOAD_UNAVAILABLE_STATUS = "download_unavailable"
+VISUAL_FAILED_STATUS = "visual_failed"
+SKIPPED_VISUAL_STATUSES = {DOWNLOAD_UNAVAILABLE_STATUS, VISUAL_FAILED_STATUS}
+# Cosmos needs more frames than its temporal patch size (2). Very short clips
+# are sampled at a higher rate so every sample has at least this many frames.
+MIN_SAMPLE_FRAMES = 4
 SEGMENT_REVIEW_ATTEMPTS = 2
 LOCATION_REVIEW_ATTEMPTS = 2
 
@@ -790,6 +800,10 @@ Allowed location_evidence values: metadata, embedded_text, both, none.
 """.strip()
 
 
+class VideoDownloadError(RuntimeError):
+    """The source video could not be downloaded."""
+
+
 def reset_temp_directory() -> None:
     if settings.TEMP_DIR.exists():
         shutil.rmtree(settings.TEMP_DIR)
@@ -943,10 +957,16 @@ def _create_boundary_sample(video_path: Path, cut_time: float, duration: float, 
     return destination, boundary_in_clip
 
 
+def _sample_fps(duration: float, frame_budget: int, max_fps: float) -> float:
+    """Spread the frame budget over the clip, never below MIN_SAMPLE_FRAMES."""
+    duration = max(duration, 0.001)
+    fps = min(max_fps, max(0.01, frame_budget / duration))
+    return max(fps, MIN_SAMPLE_FRAMES / duration)
+
+
 def _create_segment_sample(video_path: Path, segment: FullSegment, destination: Path) -> tuple[Path, float]:
-    sample_fps = min(
-        settings.SAMPLE_MAX_FPS,
-        max(0.01, settings.SAMPLE_FRAME_COUNT / max(segment.duration, 0.001)),
+    sample_fps = _sample_fps(
+        segment.duration, settings.SAMPLE_FRAME_COUNT, settings.SAMPLE_MAX_FPS
     )
     command = [
         "ffmpeg",
@@ -991,12 +1011,10 @@ def _create_location_sample(
     video_path: Path, segment: FullSegment, destination: Path
 ) -> tuple[Path, float]:
     """Create a higher resolution full segment sample for reading small text."""
-    sample_fps = min(
+    sample_fps = _sample_fps(
+        segment.duration,
+        settings.LOCATION_SAMPLE_FRAME_COUNT,
         settings.LOCATION_SAMPLE_MAX_FPS,
-        max(
-            0.01,
-            settings.LOCATION_SAMPLE_FRAME_COUNT / max(segment.duration, 0.001),
-        ),
     )
     command = [
         "ffmpeg",
@@ -1074,6 +1092,18 @@ def _needs_location_visual_review(segment: Dict[str, Any]) -> bool:
     if _location_is_resolved(segment) or _has_structured_location(segment):
         return False
     return not _location_review_is_current(segment)
+
+
+def _terminalise_location_review_errors(record: Dict[str, Any]) -> int:
+    skipped = 0
+    for segment in record.get("segments", []):
+        review = segment.get("location_visual_review") if isinstance(segment, dict) else None
+        if isinstance(review, dict) and review.get("error"):
+            review["terminal_error"] = str(review["error"])
+            review["error"] = None
+            review["retry_exhausted"] = True
+            skipped += 1
+    return skipped
 
 
 def has_location_visual_review_errors(record: Dict[str, Any]) -> bool:
@@ -1250,7 +1280,10 @@ def analyse_video(video_id: str, record: Dict[str, Any], judge: CosmosCrashJudge
         video_path = existing_path
         log(f"Reusing downloaded video for {video_id}")
     else:
-        video_path = download_video(video_id)
+        try:
+            video_path = download_video(video_id)
+        except Exception as exc:
+            raise VideoDownloadError(str(exc)) from exc
     record["downloaded_path"] = str(video_path)
     try:
         duration = float(record.get("duration_seconds"))
@@ -1450,6 +1483,24 @@ def analyse_video(video_id: str, record: Dict[str, Any], judge: CosmosCrashJudge
     return record
 
 
+def _record_visual_exception(
+    video_id: str, record: Dict[str, Any], exc: Exception
+) -> None:
+    """Retry a processing failure a bounded number of cycles, then skip."""
+    try:
+        failures = max(0, int(record.get("visual_exception_cycles", 0))) + 1
+    except (TypeError, ValueError):
+        failures = 1
+    record["visual_exception_cycles"] = failures
+    record["error"] = str(exc)
+    if failures >= settings.MAX_REVIEW_CYCLES:
+        record["status"] = VISUAL_FAILED_STATUS
+        log(f"Skipping video {video_id} after {failures} failed cycles: {exc}")
+    else:
+        record["status"] = "visual_error"
+        log(f"Visual processing failed for {video_id}: {exc}")
+
+
 def run_visual_stage(state: Dict[str, Any], after_video: Optional[Any] = None) -> int:
     pending = [
         (video_id, record)
@@ -1457,6 +1508,7 @@ def run_visual_stage(state: Dict[str, Any], after_video: Optional[Any] = None) -
         if isinstance(record, dict)
         and isinstance(record.get("text_decision"), dict)
         and record["text_decision"].get("include")
+        and record.get("status") not in SKIPPED_VISUAL_STATUSES
         and (
             record.get("status") not in {"complete", "visual_rejected"}
             or record.get("visual_review_version") != CRASH_REVIEW_VERSION
@@ -1473,13 +1525,18 @@ def run_visual_stage(state: Dict[str, Any], after_video: Optional[Any] = None) -
             log(f"Analysing full crash clips in {video_id}")
             try:
                 analyse_video(video_id, record, judge)
+                record.pop("visual_exception_cycles", None)
             except KeyboardInterrupt:
                 save_state(settings.STATE_JSON, state)
                 raise
-            except Exception as exc:
-                record["status"] = "visual_error"
+            except VideoDownloadError as exc:
+                reason = classify_download_failure(exc) or "download_failed"
+                record["status"] = DOWNLOAD_UNAVAILABLE_STATUS
+                record["download_failure"] = reason
                 record["error"] = str(exc)
-                log(f"Visual processing failed for {video_id}: {exc}")
+                log(f"Skipping video {video_id} after failed download ({reason}): {exc}")
+            except Exception as exc:
+                _record_visual_exception(video_id, record, exc)
             save_state(settings.STATE_JSON, state)
             if after_video is not None:
                 after_video(state)
@@ -1493,6 +1550,7 @@ def run_location_visual_stage(state: Dict[str, Any]) -> int:
     """Reopen retained videos to recover missed location overlays."""
     pending_records: List[tuple[str, Dict[str, Any], Path]] = []
     finished_records: List[tuple[Dict[str, Any], Path]] = []
+    state_changed = False
     for video_id, record in state.get("videos", {}).items():
         if (
             not isinstance(record, dict)
@@ -1500,10 +1558,16 @@ def run_location_visual_stage(state: Dict[str, Any]) -> int:
         ):
             continue
         stored_path = optional_text(record.get("downloaded_path"))
-        if not stored_path:
-            continue
-        video_path = Path(stored_path)
-        if not video_path.is_file():
+        video_path = Path(stored_path) if stored_path else None
+        if video_path is None or not video_path.is_file():
+            # A retryable location error without its source would otherwise
+            # keep the record unfinished forever and block discovery.
+            if _terminalise_location_review_errors(record):
+                log(
+                    f"Skipping location review retry for {video_id}: "
+                    "source video is no longer available"
+                )
+                state_changed = True
             continue
         needs_location_review = record.get("status") == "complete" and any(
             isinstance(segment, dict) and _needs_location_visual_review(segment)
@@ -1514,13 +1578,12 @@ def run_location_visual_stage(state: Dict[str, Any]) -> int:
         else:
             finished_records.append((record, video_path))
 
-    deleted_finished_video = False
     for record, video_path in finished_records:
-        deleted_finished_video = (
+        state_changed = (
             _delete_downloaded_video_when_finished(record, video_path)
-            or deleted_finished_video
+            or state_changed
         )
-    if deleted_finished_video:
+    if state_changed:
         save_state(settings.STATE_JSON, state)
 
     if not pending_records:

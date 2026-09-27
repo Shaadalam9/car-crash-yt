@@ -6,6 +6,7 @@ import json
 import re
 import time
 from typing import Any, Dict, List, Optional, Sequence
+from urllib.error import HTTPError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
@@ -82,7 +83,14 @@ TERMINAL_LOCATION_STATUSES = {
     "not_found",
     "rejected_result",
     "no_evidence",
+    "failed_terminal",
 }
+
+# Nominatim client errors (4xx other than 429) reject the query itself, so
+# retrying it every cycle can never succeed. Such failures become terminal
+# after this many attempts; network, 5xx and rate limit failures stay
+# retryable.
+MAX_GEOCODE_CLIENT_ERROR_ATTEMPTS = 3
 
 
 def _continent(iso2: Optional[str]) -> Optional[str]:
@@ -123,12 +131,19 @@ def _looks_like_coordinate_text(value: Any) -> bool:
     return bool(north_south and east_west)
 
 
+def _looks_like_ip_address(value: Any) -> bool:
+    return bool(
+        re.fullmatch(r"\d{1,3}(?:\.\d{1,3}){3}(?::\d+)?", clean_text(value))
+    )
+
+
 def _place_text(value: Any) -> Optional[str]:
     text = optional_text(value)
     if (
         text is None
         or text.casefold() in NULL_PLACE_VALUES
         or _looks_like_coordinate_text(text)
+        or _looks_like_ip_address(text)
     ):
         return None
     return text
@@ -687,6 +702,8 @@ def geocode(fields: Dict[str, Any], cache: Dict[str, Any]) -> Dict[str, Any]:
         lat = lon = None
 
     query = optional_text(fields.get("_location_query"))
+    if query is not None and _looks_like_ip_address(query):
+        query = None
     if query is None and locality:
         query = _canonical_query(locality, state_name, country_name)
 
@@ -765,6 +782,9 @@ def geocode(fields: Dict[str, Any], cache: Dict[str, Any]) -> Dict[str, Any]:
     except Exception as exc:
         # Network/rate limit failures are intentionally not cached.
         result["geocode_status"] = f"failed: {exc}"
+        result["geocode_client_error"] = (
+            isinstance(exc, HTTPError) and 400 <= exc.code < 500 and exc.code != 429
+        )
         return result
 
     if canonical is None:
@@ -869,6 +889,7 @@ def _location_candidates(
             or len(text) > 180
             or text.casefold() in NULL_PLACE_VALUES
             or _looks_like_coordinate_text(text)
+            or _looks_like_ip_address(text)
         ):
             return
 
@@ -975,6 +996,32 @@ def _is_retryable_status(status: str) -> bool:
     return status == "not_attempted" or status.startswith("failed:")
 
 
+def _cap_client_error_retries(
+    resolved: Dict[str, Any],
+    previous: Any,
+) -> None:
+    """Make a repeatedly rejected query terminal instead of retrying forever."""
+    if not resolved.get("geocode_client_error"):
+        resolved.pop("geocode_client_error_attempts", None)
+        return
+
+    attempts = 0
+    if (
+        isinstance(previous, dict)
+        and previous.get("location_resolution_version")
+        == LOCATION_RESOLUTION_VERSION
+    ):
+        try:
+            attempts = max(0, int(previous.get("geocode_client_error_attempts", 0)))
+        except (TypeError, ValueError):
+            attempts = 0
+    attempts += 1
+    resolved["geocode_client_error_attempts"] = attempts
+    if attempts >= MAX_GEOCODE_CLIENT_ERROR_ATTEMPTS:
+        resolved["geocode_rejection_reason"] = resolved.get("geocode_status")
+        resolved["geocode_status"] = "failed_terminal"
+
+
 def run_location_stage(
     state: Dict[str, Any],
     max_segments: Optional[int] = None,
@@ -1066,6 +1113,7 @@ def run_location_stage(
                             elif first_terminal is not None:
                                 resolved = first_terminal
 
+                    _cap_client_error_retries(resolved, existing_location)
                     segment["location"] = resolved
                     processed += 1
 

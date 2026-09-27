@@ -21,12 +21,12 @@ from __future__ import annotations
 
 import math
 import tempfile
-import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from . import settings
 from .shared import (
+    classify_download_failure,
     clean_text,
     log,
     normalise_string_list,
@@ -39,22 +39,16 @@ from .shared import (
 CRASH_TAXONOMY_VERSION = "nhtsa_mmucc6_video_v1"
 CRASH_TAXONOMY_STANDARD = "NHTSA MMUCC 6th Edition (2024)"
 TAXONOMY_REVIEW_ATTEMPTS = 2
-TAXONOMY_DOWNLOAD_RETRY_SECONDS = 900
 
-# Only errors that clearly indicate the source itself is unavailable are
-# terminal. Network, DNS, timeout, rate limit, authentication and other
-# operational failures remain retryable.
-_TERMINAL_VIDEO_DOWNLOAD_MARKERS = (
-    "video unavailable",
-    "this video is unavailable",
-    "private video",
-    "this video is private",
-    "video has been removed",
-    "has been removed by the uploader",
-    "has been removed for violating",
-    "this video is no longer available",
-    "account associated with this video has been terminated",
-)
+# A failed download is skipped immediately; yt-dlp already retries internally.
+# Retrying on later cycles kept records pending forever and, because pending
+# taxonomy blocks discovery, stalled the whole pipeline. Clearing
+# ``crash_taxonomy_version`` on such segments re-queues them.
+DOWNLOAD_TERMINAL_STATUSES = {
+    "video_unavailable",
+    "age_restricted",
+    "download_failed",
+}
 
 
 EVENT_KINDS = {
@@ -459,46 +453,22 @@ def _mark_video_unavailable(
     record: Dict[str, Any],
     segments: List[Dict[str, Any]],
     error: str,
+    status: str = "video_unavailable",
 ) -> None:
     for segment in segments:
         segment.update(
             _taxonomy_empty_fields(
-                "video_unavailable",
+                status,
                 error=error,
             )
         )
 
-    record["crash_taxonomy_status"] = "video_unavailable"
+    record["crash_taxonomy_status"] = status
     record["crash_taxonomy_error"] = error
     record["crash_taxonomy_version"] = CRASH_TAXONOMY_VERSION
+    # Fields written by the earlier cooldown-based retry logic.
     record.pop("crash_taxonomy_download_retry_after", None)
-
-
-def _is_terminal_video_download_error(error: str) -> bool:
-    """Return True only for errors that clearly describe an unavailable source."""
-    normalised = clean_text(error).casefold()
-    return any(
-        marker in normalised
-        for marker in _TERMINAL_VIDEO_DOWNLOAD_MARKERS
-    )
-
-
-def _mark_retryable_video_download_error(
-    record: Dict[str, Any],
-    error: str,
-) -> None:
-    """
-    Preserve taxonomy as pending after an operational download failure.
-
-    A short cooldown prevents the same video from monopolising a pipeline that
-    intentionally processes only one historical taxonomy video per cycle.
-    """
-    record["crash_taxonomy_status"] = "download_error"
-    record["crash_taxonomy_error"] = error
-    record.pop("crash_taxonomy_version", None)
-    record["crash_taxonomy_download_retry_after"] = (
-        time.time() + TAXONOMY_DOWNLOAD_RETRY_SECONDS
-    )
+    record.pop("crash_taxonomy_download_attempts", None)
 
 
 def _existing_video_path(video_id: str, record: Dict[str, Any]) -> Optional[Path]:
@@ -697,25 +667,7 @@ def run_crash_taxonomy_stage(
         except (TypeError, ValueError):
             raise ValueError("max_videos must be a positive integer")
 
-    # Skip videos that are cooling down after a transient download failure.
-    # This is important when max_videos=1: the next historical video can still
-    # progress instead of the first failing video starving the whole queue.
-    now = time.time()
-    pending_records = []
-    for video_id, record in all_pending_records:
-        try:
-            retry_after = float(
-                record.get("crash_taxonomy_download_retry_after", 0.0) or 0.0
-            )
-        except (TypeError, ValueError):
-            retry_after = 0.0
-
-        if retry_after > now:
-            continue
-
-        pending_records.append((video_id, record))
-        if len(pending_records) >= video_limit:
-            break
+    pending_records = all_pending_records[:video_limit]
 
     if not pending_records:
         return 0
@@ -736,26 +688,16 @@ def run_crash_taxonomy_stage(
                 raise
             except Exception as exc:
                 error = clean_text(exc) or "video_download_failed"
-
-                if _is_terminal_video_download_error(error):
-                    _mark_video_unavailable(record, segments, error)
-                    log(
-                        f"Skipping taxonomy backfill for unavailable video "
-                        f"{video_id}: {error}"
-                    )
-                    processed += len(segments)
-                else:
-                    _mark_retryable_video_download_error(record, error)
-                    log(
-                        f"Deferring taxonomy backfill after retryable video "
-                        f"download failure for {video_id}: {error}"
-                    )
-
+                status = classify_download_failure(error) or "download_failed"
+                _mark_video_unavailable(record, segments, error, status)
+                log(f"Skipping taxonomy backfill for {video_id} ({status}): {error}")
+                processed += len(segments)
                 save_state(settings.STATE_JSON, state)
                 continue
 
-            # A successful reuse or download clears any previous cooldown.
+            # Clear leftovers from the earlier cooldown-based retry logic.
             record.pop("crash_taxonomy_download_retry_after", None)
+            record.pop("crash_taxonomy_download_attempts", None)
             if record.get("crash_taxonomy_status") == "download_error":
                 record["crash_taxonomy_status"] = None
                 record["crash_taxonomy_error"] = None

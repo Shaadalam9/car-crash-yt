@@ -8,6 +8,7 @@ from typing import Any, Dict
 from . import settings
 from .crash_review import (
     CRASH_REVIEW_VERSION,
+    SKIPPED_VISUAL_STATUSES,
     has_location_visual_review_errors,
     has_visual_review_errors,
     reset_temp_directory,
@@ -25,7 +26,13 @@ from .shared import empty_state, load_json, log, require_binary, save_state
 from .youtube_discovery import YouTubeDiscovery, load_api_keys
 
 
-FINAL_STATUSES = {"complete", "text_rejected", "visual_rejected"}
+FINAL_STATUSES = {
+    "complete",
+    "text_rejected",
+    "text_failed",
+    "visual_rejected",
+    *SKIPPED_VISUAL_STATUSES,
+}
 
 # Historical migrations are deliberately interleaved. One taxonomy video gets
 # GPU time first, followed by a small Nominatim batch. This keeps both backlogs
@@ -59,6 +66,9 @@ def requires_processing(record: Any) -> bool:
         return True
 
     if not decision.get("include"):
+        return False
+
+    if record.get("status") in SKIPPED_VISUAL_STATUSES:
         return False
 
     if has_visual_review_errors(record):

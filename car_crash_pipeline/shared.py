@@ -15,6 +15,37 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
 
+# Only errors that clearly describe the source itself are classified. Network,
+# DNS, timeout, rate limit, bot check and other operational failures return
+# None and remain retryable.
+_UNAVAILABLE_DOWNLOAD_MARKERS = (
+    "video unavailable",
+    "this video is unavailable",
+    "private video",
+    "this video is private",
+    "video has been removed",
+    "has been removed by the uploader",
+    "has been removed for violating",
+    "this video is no longer available",
+    "account associated with this video has been terminated",
+)
+_AGE_RESTRICTED_DOWNLOAD_MARKERS = (
+    "age-restricted",
+    "age restricted",
+    "confirm your age",
+)
+
+
+def classify_download_failure(error: Any) -> Optional[str]:
+    """Return ``video_unavailable``, ``age_restricted`` or None (retryable)."""
+    normalised = re.sub(r"\s+", " ", str(error or "")).strip().casefold()
+    if any(marker in normalised for marker in _UNAVAILABLE_DOWNLOAD_MARKERS):
+        return "video_unavailable"
+    if any(marker in normalised for marker in _AGE_RESTRICTED_DOWNLOAD_MARKERS):
+        return "age_restricted"
+    return None
+
+
 def log(message: str) -> None:
     stamp = datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S")
     print(f"[{stamp}] {message}", flush=True)

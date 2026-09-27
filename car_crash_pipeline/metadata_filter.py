@@ -138,9 +138,25 @@ def run_text_stage(state: Dict[str, Any]) -> int:
                 save_state(settings.STATE_JSON, state)
                 raise
             except Exception as exc:
-                record["status"] = "text_error"
                 record["error"] = str(exc)
-                log(f"Metadata filtering failed for {video_id}: {exc}")
+                try:
+                    failures = max(0, int(record.get("text_error_cycles", 0))) + 1
+                except (TypeError, ValueError):
+                    failures = 1
+                record["text_error_cycles"] = failures
+                if failures >= settings.MAX_REVIEW_CYCLES:
+                    # Skip instead of retrying (and reloading the model) forever.
+                    record["text_decision"] = {
+                        "include": False,
+                        "confidence": 0.0,
+                        "short_reason": "Metadata screening kept failing.",
+                        "error": str(exc),
+                    }
+                    record["status"] = "text_failed"
+                    log(f"Skipping {video_id} after {failures} failed metadata screenings: {exc}")
+                else:
+                    record["status"] = "text_error"
+                    log(f"Metadata filtering failed for {video_id}: {exc}")
             save_state(settings.STATE_JSON, state)
             processed += 1
     finally:
