@@ -6,6 +6,7 @@ dist/
 wheels/
 *.egg-info
 .DS_Store
+.claude
 
 # Secrets and local configuration
 secret
@@ -32,3 +33,5 @@ state.json
 geocode_cache.json
 
 _output
+collision_frames
+figures
